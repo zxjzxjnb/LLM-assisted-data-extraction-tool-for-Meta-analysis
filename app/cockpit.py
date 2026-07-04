@@ -10,6 +10,7 @@ Launch:  streamlit run app/cockpit.py
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -21,10 +22,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from metaextract import cockpit_cache, reviewstore  # noqa: E402
 from metaextract.families import get_family  # noqa: E402
-from metaextract.highlight import locate_value  # noqa: E402
+from metaextract.highlight import Match, locate_value, locate_value_in_span, locate_values  # noqa: E402
 from metaextract.render import render_page, render_region  # noqa: E402
 from metaextract.sampling import find_sample_size_candidates  # noqa: E402
-from metaextract.sourcedoc import BBox  # noqa: E402
+from metaextract.sourcedoc import BBox, SourceBlock  # noqa: E402
 from metaextract.tabular import make_pairings, parse_block  # noqa: E402
 
 st.set_page_config(page_title="MetaExtract cockpit", layout="wide")
@@ -50,16 +51,35 @@ def _figure_caption(doc, page):
     return caps[0] if caps else ""
 
 
+def _evidence_payload(
+    block: SourceBlock, match: Match, source: str, evidence_text: str | None = None
+) -> dict:
+    return {
+        "source": source,
+        "block_id": block.block_id,
+        "page": block.page,
+        "bbox": list(match.bbox.as_tuple()),
+        "evidence_text": evidence_text or " ".join(w.text for w in match.words),
+        "exact": match.exact,
+    }
+
+
 def _locate_on_page(doc, page, value):
-    """Highlight a value wherever it sits on the page — not just the located block.
-    Essential for transposed / multi-block tables where the value the human reads
-    lives in a different block than the one the region points at."""
+    """Return every match on the page, including duplicates within one block."""
     out = []
     for b in doc.blocks_on(page):
-        m = locate_value(b, value)
-        if m:
-            out.append(m.bbox)
+        for m in locate_values(b, value):
+            out.append({"block": b, "match": m})
     return out
+
+
+def _match_label(hit: dict) -> str:
+    ev = " ".join(w.text for w in hit["match"].words)
+    return f"{hit['block'].block_id} · p{hit['block'].page} · {ev[:80]}"
+
+
+def _value_key(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
 
 
 def _pdf_path(study: str) -> Path:
@@ -76,16 +96,33 @@ def main() -> None:
 
     entry = st.sidebar.selectbox("Paper", entries, format_func=lambda e: e.label)
     study = entry.study
-    doc, out = cockpit_cache.load(ROOT, study, stamp=entry.stamp)
+    try:
+        doc, out = cockpit_cache.load(ROOT, study, stamp=entry.stamp)
+    except cockpit_cache.CacheError as e:
+        # A corrupt / outdated cache must not crash the page with a traceback — show
+        # the one clear remedy (re-run prepare_paper) and stop this run cleanly.
+        st.error(f"⚠ {e}")
+        st.stop()
     # The analysis family drives the whole input form (which numbers a record
     # holds). Older caches have no family and default to continuous (today's form).
     family = get_family(getattr(out, "analysis_family", None))
+    # Per-record covariates declared by the task pack (e.g. depth, fraction). Empty
+    # on caches prepared before covariates existed, so the form looks unchanged.
+    covariates = list(getattr(out, "record_covariates", []) or [])
     # Resume: seed this session's records from the saved draft (autosaved below).
     # Keyed by the task pack stamp so records assembled under different target
     # metrics never mix (matches the extract cache's filename stamping).
     stamp = out.task_stamp
     scope = f"{study}_{stamp or 'legacy'}"
     draft = reviewstore.load_draft(ROOT, study, stamp=stamp)
+    # A corrupt draft is quarantined and reported only on the run that finds it
+    # (it's renamed aside after), so latch the warning in session_state to keep it
+    # visible for the rest of the session instead of flashing once.
+    err_key = f"draft_error_{scope}"
+    if draft.get("error"):
+        st.session_state[err_key] = draft["error"]
+    if st.session_state.get(err_key):
+        st.error(f"⚠ {st.session_state[err_key]}")
     records = st.session_state.setdefault(f"records_{study}_{stamp}", draft["records"])
     saved_mods = draft.get("moderators", {})
 
@@ -100,7 +137,17 @@ def main() -> None:
     st.sidebar.metric("Records assembled", len(records))
 
     if not out.regions:
-        st.info("No located regions in this paper.")
+        # An excluded paper is the Tier-1 screen working, not a broken view — show
+        # the verdict and the model's reason so it reads as "correctly skipped".
+        if not out.screening.include:
+            st.warning("🚫 This paper was screened **out** as off-topic for this meta-analysis.")
+            if out.screening.reason:
+                st.caption(f"Why: {out.screening.reason}")
+            st.info("That is the screening step doing its job. Pick an included paper "
+                    "(e.g. **P1**) from the sidebar to see located evidence.")
+        else:
+            st.info("This paper was included, but no regions were located. Try re-running "
+                    "`python scripts/prepare_paper.py` for it, or pick another paper.")
         return
 
     labels = [f"{r.variable_name}  ·  {r.citation.block_id} (p{r.citation.page})" for r in out.regions]
@@ -156,6 +203,22 @@ def main() -> None:
             st.warning("Model marked this region ambiguous — verify it really holds this variable.")
 
         values_to_highlight: list[BBox] = []
+
+        # Per-record covariates (e.g. depth, fraction): filled here, exported as
+        # their own columns. They vary record to record, so — unlike the paper-level
+        # moderators above — they live on the record, letting one variable measured
+        # at several depths keep each depth on its own row instead of in the group
+        # name. Rendered once here so manual, figure, and auto-pairing records share
+        # the same values. The human fills them; locate never guesses them.
+        covariate_values: dict[str, str] = {}
+        if covariates:
+            st.markdown("**Per-record covariates** — vary per record (e.g. depth, fraction)")
+            ccols = st.columns(min(len(covariates), 3))
+            for i, cov in enumerate(covariates):
+                covariate_values[cov] = ccols[i % len(ccols)].text_input(
+                    cov, key=f"cov_{scope}_{region.region_id}_{cov}"
+                ).strip()
+
         if region.citation.kind == "figure":
             st.info("Figure — read values with a digitizer (WebPlotDigitizer); AI never reads chart values (v3.1 §6).")
             cap = _figure_caption(doc, region.citation.page)
@@ -180,7 +243,7 @@ def main() -> None:
             )
             pair = {
                 "control_group": ctrl, "treatment_group": trt,
-                **fig_entered,
+                **fig_entered, **covariate_values,
                 "source": "figure_digitized", "status": status, "digitizer_ref": digiref,
             }
             entered = {}
@@ -249,7 +312,7 @@ def main() -> None:
                                     "source_block_id": region.citation.block_id,
                                     "page": region.citation.page, "kind": region.citation.kind,
                                     "unit": "", "dispersion": "",
-                                    "n_c": n_c_val, "n_t": n_t_val, **rec,
+                                    "n_c": n_c_val, "n_t": n_t_val, **rec, **covariate_values,
                                 })
                             st.session_state[cand_key] = []
                             reviewstore.append_log(
@@ -260,12 +323,62 @@ def main() -> None:
                             )
                             st.rerun()
 
+            # --- Tier 3: on-demand AI extraction, behind the grounding gate (v3.1 §5.1) ---
+            # The only path that produces AI numbers. Each value is ground-verified
+            # against its own quoted span before it pre-fills the form; ungrounded
+            # values are shown red and never auto-filled (the human must confirm).
+            ai_key = f"ai_{scope}_{region.region_id}"
+            with st.expander("🤖 AI extract (Tier 3) — on demand · grounded before shown"):
+                st.caption(
+                    "AI reads THIS block and must quote the source span for every value. "
+                    "Each value is checked against that span and the block before it pre-fills "
+                    "below. Red = could not be grounded — don't trust it, verify by hand."
+                )
+                if st.button("Extract this region with AI", key=f"aiget_{scope}_{region.region_id}"):
+                    try:
+                        from metaextract.extract import extract_region
+
+                        slots = extract_region(block, region, family, region.variable_name)
+                        st.session_state[ai_key] = [s.model_dump() for s in slots]
+                        # pre-fill the manual-entry widgets only from grounded suggestions
+                        grounded = 0
+                        for s in slots:
+                            if s.grounding_verified and s.value is not None:
+                                st.session_state[f"{s.role}_{scope}_{region.region_id}"] = str(s.value)
+                                grounded += 1
+                        reviewstore.append_log(
+                            ROOT, study, "ai_extract",
+                            variable_name=region.variable_name, records_after=len(records),
+                            detail=f"{grounded}/{len(slots)} grounded", stamp=stamp,
+                        )
+                        st.rerun()
+                    except Exception as e:  # missing API key / network — stay usable offline
+                        st.error(f"AI extract unavailable: {e}")
+                for s in st.session_state.get(ai_key, []):
+                    ev = (s.get("citation") or {}).get("evidence_text") or ""
+                    if s["grounding_verified"]:
+                        st.success(f"✓ {s['role']} = {s['value']} · grounded in “{ev}”")
+                    else:
+                        st.error(
+                            f"⚠ {s['role']} = {s['value']} · UNVERIFIED "
+                            f"({', '.join(s['flags'])}) — verify manually"
+                        )
+
             st.markdown("**Manual entry** — works for any table layout (transposed, nested, …)")
             c1, c2 = st.columns(2)
             ctrl = c1.text_input("Control group", key=f"ctrl_{scope}_{region.region_id}")
             trt = c2.text_input("Treatment group", key=f"trt_{scope}_{region.region_id}")
             entered = {}
+            field_evidence: dict[str, dict] = {}
             unmatched = []
+            # grounded AI suggestions, by role — used to highlight a value at its
+            # OWN cited block first (its real evidence) rather than scanning the
+            # whole page, which would also light up any duplicate of that number.
+            ai_grounded = {
+                s["role"]: s
+                for s in st.session_state.get(ai_key, [])
+                if s["grounding_verified"] and s["value"] is not None
+            }
             cols = st.columns(3)
             for j, fld in enumerate(family.fields):
                 dflt = default_n if fld.is_n else ""
@@ -276,10 +389,53 @@ def main() -> None:
                 # highlight table values in the source; n-style values come from the
                 # methods, not the table, so they are not searched for.
                 if v.strip() and fld.highlight:
-                    hits = _locate_on_page(doc, region.citation.page, v.strip())
-                    values_to_highlight.extend(hits)
-                    if not hits:
-                        unmatched.append(fld.label)
+                    s = ai_grounded.get(fld.role)
+                    citation = s.get("citation") if s else {}
+                    cited = doc.block((citation or {}).get("block_id", "")) if s else None
+                    evidence_text = (citation or {}).get("evidence_text") or ""
+                    span_hit = (
+                        locate_value_in_span(cited, v.strip(), evidence_text)
+                        if cited is not None and str(s["value"]) == v.strip() and evidence_text
+                        else None
+                    )
+                    if span_hit is not None:
+                        values_to_highlight.append(span_hit.bbox)  # precise: AI's own evidence
+                        field_evidence[fld.role] = _evidence_payload(
+                            cited, span_hit, "ai_grounded", evidence_text=evidence_text
+                        )
+                    else:
+                        hits = _locate_on_page(doc, region.citation.page, v.strip())
+                        if len(hits) == 1:
+                            chosen = hits[0]
+                            values_to_highlight.append(chosen["match"].bbox)
+                            field_evidence[fld.role] = _evidence_payload(
+                                chosen["block"], chosen["match"], "manual"
+                            )
+                        elif len(hits) > 1:
+                            preferred = next(
+                                (
+                                    k for k, hit in enumerate(hits)
+                                    if hit["block"].block_id == region.citation.block_id
+                                ),
+                                0,
+                            )
+                            choice = st.selectbox(
+                                f"Evidence for {fld.label} ({len(hits)} matches)",
+                                range(len(hits)),
+                                index=preferred,
+                                format_func=lambda k: _match_label(hits[k]),
+                                key=(
+                                    f"ev_{fld.role}_{scope}_{region.region_id}_"
+                                    f"{_value_key(v.strip())}"
+                                ),
+                            )
+                            chosen = hits[choice]
+                            values_to_highlight.append(chosen["match"].bbox)
+                            field_evidence[fld.role] = _evidence_payload(
+                                chosen["block"], chosen["match"], "manual_selected"
+                            )
+                        else:
+                            unmatched.append(fld.label)
             u1, u2 = st.columns(2)
             unit = u1.text_input("Unit", key=f"unit_{scope}_{region.region_id}")
             # Dispersion (SD vs SE) only means something for families with an SD field.
@@ -294,7 +450,10 @@ def main() -> None:
                 "unit": unit,
                 "dispersion": dispersion,
                 **entered,
+                **covariate_values,
             }
+            if field_evidence:
+                pair["evidence"] = field_evidence
             if unmatched:
                 st.warning(f"Not found on page {region.citation.page} (typo?): {', '.join(unmatched)}")
 

@@ -45,9 +45,39 @@ def test_log_appends_with_header(tmp_path):
     assert rows[0]["variable_name"] == "SOC" and rows[0]["timestamp"]
 
 
-def test_corrupt_draft_degrades_to_empty(tmp_path):
+def test_corrupt_draft_is_quarantined_and_reported(tmp_path):
+    # An unreadable draft must not silently vanish (that would mask lost work):
+    # load reports an error, starts empty, and preserves the bad bytes aside.
+    p = reviewstore.draft_path(tmp_path, "P1")
+    p.write_text("{not json", encoding="utf-8")
+
+    draft = reviewstore.load_draft(tmp_path, "P1")
+    assert draft["records"] == [] and draft["moderators"] == {}
+    assert "could not be read" in draft["error"]
+
+    # original is moved aside (preserved for recovery), not left in place or deleted
+    assert not p.exists()
+    backups = list(reviewstore.reviews_dir(tmp_path).glob("P1.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{not json"
+
+
+def test_non_object_draft_is_treated_as_corrupt(tmp_path):
+    # Valid JSON that isn't an object (e.g. a bare list) used to crash on
+    # .setdefault; now it's quarantined like any other unreadable draft.
+    reviewstore.draft_path(tmp_path, "P1").write_text("[1, 2, 3]", encoding="utf-8")
+    draft = reviewstore.load_draft(tmp_path, "P1")
+    assert draft["records"] == [] and "error" in draft
+
+
+def test_quarantine_lets_a_fresh_draft_save_cleanly(tmp_path):
+    # After a corrupt draft is moved aside, the next save round-trips normally.
     reviewstore.draft_path(tmp_path, "P1").write_text("{not json", encoding="utf-8")
-    assert reviewstore.load_draft(tmp_path, "P1") == {"records": [], "moderators": {}}
+    assert "error" in reviewstore.load_draft(tmp_path, "P1")
+
+    reviewstore.save_draft(tmp_path, "P1", [{"a": 1}], {})
+    reloaded = reviewstore.load_draft(tmp_path, "P1")
+    assert reloaded["records"] == [{"a": 1}] and "error" not in reloaded
 
 
 def test_stamp_isolates_drafts_for_same_study(tmp_path):

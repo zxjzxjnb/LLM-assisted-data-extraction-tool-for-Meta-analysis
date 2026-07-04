@@ -1,9 +1,17 @@
 """metaextract: LLM-assisted data extraction for ecological meta-analysis."""
 
+from .extract import apply_grounding, extract_region, ground_verify
 from .extractor import extract_from_pdf
 from .families import FAMILIES, AnalysisFamily, RecordField, get_family
-from .highlight import Match, locate_value
-from .ingest import ingest_pdf
+from .highlight import (
+    Match,
+    locate_value,
+    locate_value_in_span,
+    locate_values,
+    numeric_in_text,
+    text_contains,
+)
+from .ingest import IngestError, ingest_pdf
 from .locate import SOIL_AGRI_SPEC, LocateOutput, TargetVar, TaskSpec, locate
 from .pipeline import run_folder
 from .records import Citation, LocatedRegion, ScreeningResult
@@ -20,12 +28,21 @@ __all__ = [
     "validate_result",
     # v3.1 cockpit foundation (M0a)
     "ingest_pdf",
+    "IngestError",
     "SourceDoc",
     "SourceBlock",
     "BBox",
     "Word",
     "locate_value",
+    "locate_values",
+    "locate_value_in_span",
     "Match",
+    "numeric_in_text",
+    "text_contains",
+    # v3.1 Tier 3: on-demand AI extraction behind grounding (M1)
+    "extract_region",
+    "ground_verify",
+    "apply_grounding",
     # v3.1 screen + locate (M0b)
     "locate",
     "LocateOutput",

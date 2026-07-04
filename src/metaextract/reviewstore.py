@@ -22,6 +22,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .fileio import atomic_write_text
+
 
 def reviews_dir(root: Path) -> Path:
     d = Path(root) / "data" / "reviews"
@@ -47,15 +49,50 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _file_stamp() -> str:
+    """Filename-safe UTC timestamp (no colons), unique to the microsecond."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+
+
+def _quarantine(path: Path) -> Path:
+    """Move an unreadable draft aside so it is preserved, not overwritten.
+
+    The cockpit autosaves on the next interaction, which would otherwise clobber
+    the only copy of the corrupt file. Renaming it out of the way keeps the bad
+    bytes around for manual recovery while letting a fresh draft start cleanly.
+    """
+    backup = path.with_name(f"{path.name}.corrupt-{_file_stamp()}")
+    path.replace(backup)
+    return backup
+
+
 def load_draft(root: Path, study: str, stamp: str | None = None) -> dict:
-    """Return the saved draft, or an empty one if none exists / is unreadable."""
+    """Return the saved draft, or an empty one if none exists.
+
+    A draft that exists but cannot be parsed (an interrupted pre-atomic write, a
+    truncated or hand-edited file, disk corruption) is NOT silently discarded —
+    that would mask lost human work. The unreadable file is moved aside to
+    ``{name}.corrupt-{timestamp}`` (so the next autosave can't overwrite it) and
+    the returned draft carries an ``error`` the cockpit surfaces to the human.
+    """
     p = draft_path(root, study, stamp)
     if not p.exists():
         return {"records": [], "moderators": {}}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {"records": [], "moderators": {}}
+        if not isinstance(data, dict):
+            raise ValueError("draft is not a JSON object")
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        backup = _quarantine(p)
+        return {
+            "records": [],
+            "moderators": {},
+            "error": (
+                f"Saved draft {p.name} could not be read ({type(e).__name__}); it was "
+                f"preserved as {backup.name} and an empty draft was started. If it held "
+                f"records, recover them from that file before adding new ones."
+            ),
+        }
     data.setdefault("records", [])
     data.setdefault("moderators", {})
     return data
@@ -76,8 +113,11 @@ def save_draft(
         "records": records,
         "moderators": moderators,
     }
-    draft_path(root, study, stamp).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    # Atomic: a refresh / restart mid-write must not truncate the draft, since
+    # that is the human's only copy of the assembled records.
+    atomic_write_text(
+        draft_path(root, study, stamp),
+        json.dumps(payload, ensure_ascii=False, indent=2),
     )
     return saved_at
 

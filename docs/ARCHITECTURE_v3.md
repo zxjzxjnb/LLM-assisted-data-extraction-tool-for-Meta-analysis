@@ -415,7 +415,20 @@ manufactures false bindings in multi-site / multi-soil / multi-depth papers
     paper), P8 GT rows lack readable values.
 
 - **M1 — Tier 3 on-demand extraction** behind grounding; red-flag failures;
-  review log feeds examples.
+  review log feeds examples. 🟡 *Scaffolding done* ([extract.py](../src/metaextract/extract.py),
+  [test_extract.py](../tests/test_extract.py)). The deterministic grounding gate
+  (§5.1) is built and tested: `ground_verify` checks the printed value appears in
+  the model's own quoted span (symbol/unicode-minus tolerant, shared with
+  [highlight.py](../src/metaextract/highlight.py) `numeric_in_text`) and that the
+  span appears in the cited block; `apply_grounding` turns the raw response into
+  `ExtractionSlot`s, setting `grounding_verified` and flagging `evidence_unverified`
+  on failure — the Tier-3 analogue of locate's C1 guard, testable without the API.
+  The cockpit wires a per-region **"🤖 AI extract"** button: grounded values pre-fill
+  the manual-entry form (and light up via the existing word-level highlight),
+  ungrounded values show **red** and are never auto-filled; each run appends an
+  `ai_extract` row to the review log (corrections are then captured by the existing
+  add/delete log — the example feed). `extract_region` is a thin Gemini wrapper,
+  **pending an API key** for a live run (same status as `locate`).
 - **M2 — second+ papers + validate/normalize**; lnRR effect-size columns on
   export; first *statistically* meaningful metrics here, not in M0.
 - **M3 — figure digitizer handoff** (§5.3, §6); batch over a folder.

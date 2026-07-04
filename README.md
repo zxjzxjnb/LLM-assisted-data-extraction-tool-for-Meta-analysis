@@ -100,6 +100,36 @@ src/metaextract/sampling.py     deterministic sample-size candidates
 src/metaextract/render.py       PDF page rendering with highlights
 ```
 
+### 3. Bounded extraction agent (optional)
+
+On top of the two layers above there is an optional **agent layer**
+(`src/metaextract/agent/`): an autonomous tool-use loop that assembles
+treatment-vs-control records from an already-located paper, instead of a human
+clicking each region in the cockpit. It is deliberately *bounded* — it inherits
+the same deterministic grounding gate the cockpit uses, so every number it commits
+must ground against its cited block, and anything it cannot ground (or any
+row-identity match it should not automate, like a merged multi-row table block) is
+flagged for a human rather than silently written.
+
+The agent is provider-pluggable behind one planner protocol:
+
+- `ReplayPlanner` — a deterministic, offline policy (no API key) that runs the
+  demo and the test suite.
+- `GeminiPlanner` — the live LLM policy (Gemini function-calling), same tools and
+  same gate.
+
+```bash
+# offline, over a cached paper — no API key needed
+metaextract agent P1 --report data/outputs/agent_run_P1.json
+python scripts/agent_demo.py P1
+
+# live LLM policy (needs a Gemini key)
+metaextract agent P1 --online
+```
+
+See [docs/AGENT.md](docs/AGENT.md) for the architecture, the tool list, and an
+honest account of what the grounding gate catches and what it does not.
+
 ## Evaluation Status
 
 Evaluation is ongoing and should be read conservatively.
@@ -126,6 +156,7 @@ nested, or figure-heavy papers still require manual confirmation or digitization
 | [docs/writeup.md](docs/writeup.md) | Draft project writeup | Explains the motivation and design, but the results section still contains TBD placeholders |
 | [docs/ARCHITECTURE_v2.md](docs/ARCHITECTURE_v2.md) | Design proposal | A schema-driven next-version architecture; not a statement of fully shipped code |
 | [docs/ARCHITECTURE_v3.md](docs/ARCHITECTURE_v3.md) | Active cockpit blueprint | Most closely matches the current product direction and implemented prototype modules |
+| [docs/AGENT.md](docs/AGENT.md) | Agent layer (scaffolding) | The optional bounded-autonomy agent: loop, tools, and what the grounding gate does and does not catch |
 
 ## Installation
 
@@ -309,11 +340,46 @@ target_variables:
 > "structurally supported" into "validated". Omitting `analysis_family` keeps the
 > validated continuous behavior unchanged.
 
+## Per-record covariates (depth, fraction, …)
+
+Some covariates vary **row to row**, not per paper. A single table often reports
+one variable at several soil depths (e.g. `0–20`, `20–40`, `40–60` cm), so the
+depth belongs on each record, not bound once to the whole paper. Declaring it as
+a `record_covariate` gives the cockpit a dedicated per-record field and exports
+it as its own column — instead of jamming the depth into the group name or
+forcing one depth onto every record.
+
+```yaml
+domain: soil_C_fractions_landuse
+target_variables: [ ... ]
+moderators:                 # paper/site-level: one value bound to every record
+  - Experimental site
+  - Soil type
+record_covariates:          # per-record: filled per row, one column each
+  - Depth cm
+```
+
+- **`moderators`** are paper-level — the human binds one value that broadcasts to
+  every exported record (`{**bound, **record}`).
+- **`record_covariates`** are per-record — the cockpit shows one input per name in
+  the entry form; you fill it for each record, and each exports as its own column.
+  Locate never guesses the value (assigning the right depth to a row is the kind
+  of matching deliberately left to the human).
+
+Covariate names are validated against the structural columns, the family's value
+fields, and the moderator names, so a name collision fails the pack loudly rather
+than silently overwriting a column on export. Adding or removing a covariate
+changes the task-pack stamp, so re-run `prepare_paper.py` for cached papers (a
+covariate-free pack keeps the old stamp, so existing continuous caches/drafts are
+untouched).
+
 ## Roadmap
 
 - tighten the cockpit export path for reviewed records
-- separate paper-level moderators from record-level values until a human binds
-  them
+- per-record covariates now separate row-level values (e.g. depth) from
+  paper-level moderators; next: a batch helper that reuses one control across
+  treatments while keeping each record's covariates (revives the fast path on
+  transposed/nested tables, where auto-pairing can't)
 - add more explicit review logs and provenance reports
 - improve support for figure digitization handoff
 - expand evaluation beyond smoke tests into a larger curated ground-truth set

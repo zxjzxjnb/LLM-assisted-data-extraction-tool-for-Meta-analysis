@@ -8,6 +8,13 @@
 #
 # Add a metric -> add an entry, then re-run scripts/prepare_paper.py for the paper.
 # Remove a metric -> delete its entry (no re-run needed; it just stops showing).
+#
+# moderators        = paper/site-level; one value is bound to every record from the paper.
+# record_covariates = per-record; vary row to row (e.g. soil depth, when one variable
+#                     is measured at several depths). The cockpit shows one input per
+#                     name and exports each as its own column. Depth lives here, not
+#                     under moderators, so a multi-depth table keeps each depth on its
+#                     own record. Re-run prepare_paper.py after changing these.
 
 domain: soil_C_fractions_landuse
 target_variables:
@@ -150,6 +157,7 @@ moderators:
 - Soil texture
 - Soil type
 - Elevation
-- Depth cm
 - Years
 - Climate
+record_covariates:
+- Depth cm

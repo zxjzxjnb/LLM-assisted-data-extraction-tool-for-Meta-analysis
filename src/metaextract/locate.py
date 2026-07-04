@@ -26,7 +26,7 @@ from typing import Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .families import DEFAULT_FAMILY, get_family
+from .families import DEFAULT_FAMILY, RESERVED_RECORD_KEYS, get_family
 from .records import Citation, ExtractedModerator, LocatedRegion, SampleSize, ScreeningResult
 from .sourcedoc import SourceDoc
 
@@ -103,6 +103,13 @@ class TaskSpec(BaseModel):
     # per-record field set / cockpit form. Defaults to the only family validated on
     # real papers; others are experimental.
     analysis_family: str = DEFAULT_FAMILY
+    # Per-record covariates the cockpit captures as free-text fields and exports as
+    # their own columns (e.g. soil depth, fraction). Unlike ``moderators`` — which
+    # are paper-level and broadcast to every record — these vary *row to row*, so a
+    # nested table (one variable measured at several depths) keeps each depth on its
+    # own record instead of jamming it into the group name. The pack declares the
+    # field names; the human fills the value per record (locate never guesses them).
+    record_covariates: list[str] = Field(default_factory=list)
 
     @field_validator("target_variables", mode="before")
     @classmethod
@@ -121,7 +128,7 @@ class TaskSpec(BaseModel):
 
         # Fail loudly on a typo'd family rather than silently collecting the wrong
         # shape; get_family raises KeyError listing the known names.
-        get_family(self.analysis_family)
+        family = get_family(self.analysis_family)
 
         seen: set[str] = set()
         for tv in self.target_variables:
@@ -129,6 +136,29 @@ class TaskSpec(BaseModel):
             if key in seen:
                 raise ValueError(f"duplicate target variable name: {tv.name!r}")
             seen.add(key)
+
+        # Record covariates become CSV columns, so a blank/duplicate name or one
+        # that collides with a structural key, a family value field, or a moderator
+        # would silently overwrite real data on export — reject it here instead.
+        self.record_covariates = [c.strip() for c in self.record_covariates]
+        taken = (
+            {k.casefold() for k in RESERVED_RECORD_KEYS}
+            | {r.casefold() for r in family.roles}
+            | {m.casefold() for m in self.moderators}
+        )
+        cov_seen: set[str] = set()
+        for cov in self.record_covariates:
+            if not cov:
+                raise ValueError("record_covariates entries must not be blank")
+            key = cov.casefold()
+            if key in cov_seen:
+                raise ValueError(f"duplicate record covariate: {cov!r}")
+            cov_seen.add(key)
+            if key in taken:
+                raise ValueError(
+                    f"record covariate {cov!r} collides with a reserved column, a "
+                    f"{self.analysis_family} value field, or a moderator name"
+                )
         return self
 
     @property
@@ -147,6 +177,11 @@ class TaskSpec(BaseModel):
         # what we want — binary and continuous records must not mix.
         if data.get("analysis_family") == DEFAULT_FAMILY:
             data.pop("analysis_family", None)
+        # Same reasoning for record_covariates: an empty list is "no change", so it
+        # stays out of the digest and existing packs keep their stamp; declaring
+        # covariates does change the stamp (records gain columns — don't mix them).
+        if not data.get("record_covariates"):
+            data.pop("record_covariates", None)
         payload = json.dumps(data, sort_keys=True, ensure_ascii=False)
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
 
@@ -238,6 +273,10 @@ class LocateOutput(BaseModel):
     # input form from it. Defaults to continuous so caches written before families
     # existed render exactly as before.
     analysis_family: str = DEFAULT_FAMILY
+    # Per-record covariate field names from the task pack (see TaskSpec); the
+    # cockpit renders one input per name and exports each as its own column.
+    # Empty on caches written before covariates existed -> the form is unchanged.
+    record_covariates: list[str] = Field(default_factory=list)
     # Stamp of the task pack that produced this output; the cockpit keys review
     # progress by it so changing target metrics doesn't mix records. None on
     # caches written before stamping existed.
@@ -446,6 +485,7 @@ def locate(
         problems=problems,
         task_stamp=spec.cache_stamp,
         analysis_family=spec.analysis_family,
+        record_covariates=spec.record_covariates,
     )
 
 

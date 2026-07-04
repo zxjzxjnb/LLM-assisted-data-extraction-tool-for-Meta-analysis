@@ -112,3 +112,30 @@ def get_family(name: str | None) -> AnalysisFamily:
     except KeyError:
         known = ", ".join(sorted(FAMILIES))
         raise KeyError(f"unknown analysis_family {key!r}; known families: {known}") from None
+
+
+# Structural keys the cockpit always writes into a record dict (the values that
+# become CSV columns alongside the family's value fields). A task pack's
+# ``record_covariates`` must not collide with any of these — nor with a family
+# role or a paper-level moderator — or the covariate would overwrite real data
+# when records are merged for export (``{**bound, **record}``). The TaskSpec
+# validator checks this so a bad pack fails loudly instead of silently dropping a
+# column on export.
+RESERVED_RECORD_KEYS: frozenset[str] = frozenset(
+    {
+        "paper_id",
+        "variable_name",
+        "source_block_id",
+        "page",
+        "kind",
+        "control_group",
+        "treatment_group",
+        "unit",
+        "dispersion",
+        "evidence",
+        "source",
+        "status",
+        "digitizer_ref",
+        "moderator_binding_status",
+    }
+)
