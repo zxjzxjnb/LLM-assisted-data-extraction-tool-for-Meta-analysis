@@ -22,11 +22,28 @@ from .sourcedoc import BBox, SourceBlock, SourceDoc, Word
 _TEXT_BLOCK = 0  # PyMuPDF block-type code for text (1 = image)
 
 
+class IngestError(ValueError):
+    """A PDF that exists but cannot yield a usable :class:`SourceDoc`.
+
+    Raised instead of returning a degenerate empty document, so a scanned /
+    image-only PDF fails loudly at prepare time rather than silently flowing
+    downstream as a cache with nothing to locate or highlight.
+    """
+
+
 def ingest_pdf(pdf_path: str | Path) -> SourceDoc:
-    """Parse a PDF into a :class:`SourceDoc` with bbox-addressable blocks."""
+    """Parse a PDF into a :class:`SourceDoc` with bbox-addressable blocks.
+
+    Raises :class:`FileNotFoundError` if the path does not exist and
+    :class:`IngestError` if the PDF has no extractable text layer (almost always
+    a scanned / image-only PDF): the locator and the click-to-evidence highlight
+    both need real text, so an empty parse is a hard error, not a quiet result.
+    """
     import fitz  # PyMuPDF; imported lazily so the rest of the package needn't have it
 
     pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"{pdf_path}: PDF not found.")
     doc = fitz.open(pdf_path)
 
     blocks: list[SourceBlock] = []
@@ -41,12 +58,34 @@ def ingest_pdf(pdf_path: str | Path) -> SourceDoc:
     finally:
         doc.close()
 
+    _check_usable(pdf_path, len(page_sizes), blocks)
+
     return SourceDoc(
         doc_id=pdf_path.stem,
         n_pages=len(page_sizes),
         page_sizes=page_sizes,
         blocks=blocks,
     )
+
+
+def _check_usable(pdf_path: Path, n_pages: int, blocks: list[SourceBlock]) -> None:
+    """Reject a parse that the cockpit cannot act on (v3.1: fail loud, not empty).
+
+    Two structural failures, both indistinguishable from a usable doc once cached
+    so they must be caught here: a file with no pages (empty / not a real PDF), and
+    a file whose pages carry no addressable words (a scanned / image-only PDF —
+    there is text *on the page* as pixels, but no text *layer* to locate against).
+    """
+    if n_pages == 0:
+        raise IngestError(f"{pdf_path.name}: no pages — the file is empty or not a readable PDF.")
+    text_words = sum(len(b.words) for b in blocks if b.kind == "paragraph")
+    if text_words == 0:
+        raise IngestError(
+            f"{pdf_path.name}: no extractable text across {n_pages} page(s). This is almost "
+            "always a scanned / image-only PDF. Run OCR to add a text layer first "
+            "(e.g. `ocrmypdf in.pdf out.pdf`) and re-ingest — MetaExtract needs the text "
+            "layer to locate variables and to highlight values in the source."
+        )
 
 
 def _page_words(page) -> list[Word]:

@@ -9,13 +9,36 @@ cockpit reads only these, so it launches offline and makes no API calls.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
+from pathlib import Path
 
 from _gt import ROOT, build_spec, load_env
 
 # Tried in order; Gemini's hosted models 503 under load, so fall back across them.
 _MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]
+
+DEFAULT_TASKPACK = ROOT / "data" / "taskpacks" / "soil_C_fractions.yaml"
+
+
+def _load_spec(study: str):
+    """Prefer the editable task pack YAML; fall back to the GT-derived spec.
+
+    Researchers change target metrics by editing the task pack — point at a
+    different one with METAEXTRACT_TASKPACK=path.yaml.
+    """
+    from metaextract.locate import TaskSpec
+
+    env = os.environ.get("METAEXTRACT_TASKPACK")
+    path = Path(env) if env else DEFAULT_TASKPACK
+    if path.exists():
+        spec = TaskSpec.from_yaml(path)
+        print(f"  task pack: {path.name} ({len(spec.target_variables)} metrics)")
+        return spec
+    print(f"  task pack {path.name} not found -> GT-derived spec")
+    spec, _present, _rows = build_spec(study)
+    return spec
 
 
 def _locate_with_retry(locate, doc, spec, models, attempts=4):
@@ -40,13 +63,19 @@ def main() -> None:
     load_env()
 
     from metaextract import cockpit_cache
-    from metaextract.ingest import ingest_pdf
+    from metaextract.ingest import IngestError, ingest_pdf
     from metaextract.locate import locate
 
     pdf = ROOT / "data" / "sample_papers" / f"{study}.pdf"
-    spec, _present, _rows = build_spec(study)
+    spec = _load_spec(study)
 
-    doc = ingest_pdf(pdf)
+    # Fail loud and clean (no traceback) if the PDF is missing or unreadable, so a
+    # scanned paper is caught here instead of being cached as an empty doc.
+    try:
+        doc = ingest_pdf(pdf)
+    except (FileNotFoundError, IngestError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise SystemExit(1)
     print(f"{study}: ingested {doc.n_pages} pages, {len(doc.blocks)} blocks.")
     out = _locate_with_retry(locate, doc, spec, models)
     cockpit_cache.save(ROOT, study, doc, out)

@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .schema import ExtractionResult, gemini_response_schema
+
+if TYPE_CHECKING:
+    from .locate import TaskSpec
 
 DEFAULT_MODEL = os.environ.get("METAEXTRACT_MODEL", "gemini-2.5-pro")
 
@@ -43,6 +47,42 @@ USER_PROMPT = (
     "Extract the meta-analysis data from the attached paper, following the "
     "required schema exactly."
 )
+
+
+# schema.py models a fixed, soil-specific moderator set. Task pack moderators are
+# surfaced only for domains that schema actually covers; for any other domain they
+# have no schema slot and would be silently dropped, so we omit them rather than
+# mislead the model. Extend this set when schema.py gains broader moderator coverage.
+SCHEMA_NATIVE_DOMAINS = {"soil_agri_n2o", "soil_C_fractions_landuse"}
+
+
+def taskpack_instruction(task_spec: "TaskSpec | None") -> str:
+    """Render a task pack as extraction guidance without changing the fixed schema.
+
+    Target-variable guidance applies to any domain (``variable_name`` is free
+    text, so the canonical name is honored regardless). Moderator guidance is
+    emitted only for domains the fixed schema covers (:data:`SCHEMA_NATIVE_DOMAINS`);
+    for other domains the pack's moderators have no schema slot, so listing them
+    would mislead the model.
+    """
+    if task_spec is None:
+        return ""
+
+    lines = [
+        "",
+        "Task pack for this run:",
+        f"- Domain: {task_spec.domain}",
+        "- Only extract response variables that match these canonical target names",
+        "  or their aliases. Return the canonical name in `variable_name`:",
+    ]
+    lines.extend(f"  - {tv.as_prompt_line()}" for tv in task_spec.target_variables)
+
+    if task_spec.moderators and task_spec.domain in SCHEMA_NATIVE_DOMAINS:
+        lines.extend([
+            "- Prioritize these paper-level moderators when they fit the schema:",
+            "  - " + "\n  - ".join(task_spec.moderators),
+        ])
+    return "\n".join(lines)
 
 
 def _build_client(vertex: bool | None = None):
@@ -73,6 +113,7 @@ def extract_from_pdf(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.0,
     client=None,
+    task_spec: "TaskSpec | None" = None,
 ) -> ExtractionResult:
     """Run extraction on a single PDF and return a validated result.
 
@@ -93,7 +134,7 @@ def extract_from_pdf(
         model=model,
         contents=[pdf_part, USER_PROMPT],
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=SYSTEM_INSTRUCTION + taskpack_instruction(task_spec),
             temperature=temperature,
             response_mime_type="application/json",
             response_schema=gemini_response_schema(),

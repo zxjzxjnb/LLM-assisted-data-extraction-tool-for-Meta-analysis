@@ -22,7 +22,11 @@ from pydantic import BaseModel, Field
 
 from .sourcedoc import BBox
 
-SlotRole = Literal["mean_t", "sd_t", "n_t", "mean_c", "sd_c", "n_c"]
+# A slot's role is one of the active analysis family's field roles (see
+# families.py). It is a free ``str`` rather than a fixed Literal so a binary or
+# correlation family can carry its own roles (events_t, r, …) without editing
+# this model; the family registry is the single source of truth for valid roles.
+SlotRole = str
 
 
 class Citation(BaseModel):

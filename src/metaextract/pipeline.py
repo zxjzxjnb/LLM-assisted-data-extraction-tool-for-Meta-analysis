@@ -16,7 +16,9 @@ from pathlib import Path
 import pandas as pd
 
 from .extractor import DEFAULT_MODEL, extract_from_pdf, _build_client
+from .families import DEFAULT_FAMILY
 from .flatten import result_to_rows
+from .locate import TaskSpec
 
 
 @dataclass
@@ -39,11 +41,11 @@ class RunSummary:
         }
 
 
-def _extract_with_retry(pdf, client, model, retries=2):
+def _extract_with_retry(pdf, client, model, task_spec=None, retries=2):
     last = None
     for attempt in range(retries + 1):
         try:
-            return extract_from_pdf(pdf, model=model, client=client)
+            return extract_from_pdf(pdf, model=model, task_spec=task_spec, client=client)
         except Exception as e:  # noqa: BLE001 - want to retry on any API hiccup
             last = e
             if attempt < retries:
@@ -51,11 +53,22 @@ def _extract_with_retry(pdf, client, model, retries=2):
     raise last
 
 
+def _task_cache_file(
+    cache: Path | None, pdf: Path, task_spec: TaskSpec | None
+) -> Path | None:
+    if cache is None:
+        return None
+    if task_spec is None:
+        return cache / f"{pdf.stem}.json"
+    return cache / f"{pdf.stem}.{task_spec.cache_stamp}.json"
+
+
 def run_folder(
     input_dir: str | Path,
     output_csv: str | Path,
     model: str = DEFAULT_MODEL,
     cache_dir: str | Path | None = None,
+    task_spec: TaskSpec | None = None,
 ) -> RunSummary:
     """Extract every PDF in ``input_dir`` and write a combined CSV.
 
@@ -68,14 +81,28 @@ def run_folder(
     pdfs = sorted(input_dir.glob("*.pdf"))
     summary = RunSummary(total=len(pdfs))
 
+    if task_spec is not None and task_spec.analysis_family != DEFAULT_FAMILY:
+        raise ValueError(
+            "metaextract run currently supports only analysis_family="
+            f"{DEFAULT_FAMILY!r}. The locate/cockpit workflow can render "
+            f"{task_spec.analysis_family!r}, but the automatic extractor still "
+            "uses the fixed continuous mean/SD/n schema."
+        )
+
     client = _build_client()
     cache = Path(cache_dir) if cache_dir else None
     if cache:
         cache.mkdir(parents=True, exist_ok=True)
 
+    if task_spec is not None:
+        print(
+            f"Task pack: {task_spec.domain} "
+            f"({len(task_spec.target_variables)} target variable(s))"
+        )
+
     all_rows: list[dict] = []
     for pdf in pdfs:
-        cache_file = cache / f"{pdf.stem}.json" if cache else None
+        cache_file = _task_cache_file(cache, pdf, task_spec)
         try:
             if cache_file and cache_file.exists():
                 from .schema import ExtractionResult
@@ -84,7 +111,7 @@ def run_folder(
                     cache_file.read_text()
                 )
             else:
-                result = _extract_with_retry(pdf, client, model)
+                result = _extract_with_retry(pdf, client, model, task_spec=task_spec)
                 if cache_file:
                     cache_file.write_text(result.model_dump_json(indent=2))
 
