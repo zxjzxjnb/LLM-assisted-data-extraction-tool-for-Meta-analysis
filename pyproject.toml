@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Xinjie Zou" }]
 dependencies = [
     "google-genai>=1.0.0",
+    "openai>=1.0.0",
     "pydantic>=2.0",
     "pandas>=2.0",
     "pypdf>=4.0",

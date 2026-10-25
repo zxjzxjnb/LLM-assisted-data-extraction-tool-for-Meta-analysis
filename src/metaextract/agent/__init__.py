@@ -15,20 +15,30 @@ it cannot choose to trust a number the source does not support.
 
 See ``docs/AGENT.md`` for the architecture and the bounded-autonomy rationale.
 
-Two planners drive the same tools and the same gate:
+Three planner implementations drive the same core tools and grounding gate:
 
 * :class:`ReplayPlanner` — a deterministic policy that runs offline on cached
   papers (no API key). Used by the demo and the tests/CI.
 * :class:`GeminiPlanner` — the live LLM policy (Gemini function-calling).
+* :class:`OpenAICompatiblePlanner` — the shared live policy for DeepSeek and
+  other OpenAI-compatible tool-call APIs.
 """
 
 from __future__ import annotations
 
 from .gate import assemble_record, record_status, verify
 from .loop import run_agent
-from .planner import Finish, GeminiPlanner, Planner, ReplayPlanner, ToolCall
+from .planner import (
+    Finish,
+    GeminiPlanner,
+    OpenAICompatiblePlanner,
+    Planner,
+    ReplayPlanner,
+    ToolCall,
+)
 from .tools import Toolset, ToolSpec, build_toolset
 from .trace import AgentResult, AgentStep
+from .report import AgentReviewQueue, load_review_queue
 
 __all__ = [
     "run_agent",
@@ -38,10 +48,13 @@ __all__ = [
     "Planner",
     "ReplayPlanner",
     "GeminiPlanner",
+    "OpenAICompatiblePlanner",
     "ToolCall",
     "Finish",
     "AgentResult",
     "AgentStep",
+    "AgentReviewQueue",
+    "load_review_queue",
     "verify",
     "record_status",
     "assemble_record",

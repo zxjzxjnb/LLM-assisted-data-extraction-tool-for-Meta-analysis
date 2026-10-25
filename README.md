@@ -117,14 +117,24 @@ The agent is provider-pluggable behind one planner protocol:
   demo and the test suite.
 - `GeminiPlanner` — the live LLM policy (Gemini function-calling), same tools and
   same gate.
+- `OpenAICompatiblePlanner` — one shared adapter for DeepSeek and other providers
+  that expose OpenAI-compatible tool calls.
 
 ```bash
 # offline, over a cached paper — no API key needed
 metaextract agent P1 --report data/outputs/agent_run_P1.json
 python scripts/agent_demo.py P1
 
-# live LLM policy (needs a Gemini key)
+# live Gemini policy (backward-compatible shortcut)
 metaextract agent P1 --online
+
+# live DeepSeek policy
+export DEEPSEEK_API_KEY="your-api-key"
+metaextract agent P1 --provider deepseek --model deepseek-v4-flash
+
+# any OpenAI-compatible endpoint
+metaextract agent P1 --provider openai-compatible \
+  --base-url https://provider.example/v1 --model provider-model
 ```
 
 See [docs/AGENT.md](docs/AGENT.md) for the architecture, the tool list, and an
@@ -174,6 +184,12 @@ Create a `.env` file or export the required environment variable for Gemini:
 
 ```bash
 export GOOGLE_API_KEY="your-api-key"
+```
+
+For the DeepSeek agent planner, export its key separately:
+
+```bash
+export DEEPSEEK_API_KEY="your-api-key"
 ```
 
 For Vertex AI, configure the relevant Google Cloud environment variables:

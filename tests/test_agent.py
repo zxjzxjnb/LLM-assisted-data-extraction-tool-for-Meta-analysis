@@ -8,11 +8,14 @@ ReplayPlanner drives the full loop end to end.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from metaextract.agent import ReplayPlanner, build_toolset, run_agent
+from metaextract.agent import OpenAICompatiblePlanner, ReplayPlanner, build_toolset, run_agent
+from metaextract.agent.report import load_review_queue
 from metaextract.agent.gate import record_status
+from metaextract.agent.planner import Finish, ToolCall, ToolResult
 from metaextract.families import get_family
 from metaextract.locate import LocateOutput
 from metaextract.records import Citation, ExtractionSlot, LocatedRegion, ScreeningResult
@@ -78,6 +81,38 @@ def test_ground_check_accepts_real_and_rejects_fabricated():
     fake = ts.ground_check({"block_id": "p1.b1", "value": "99999.0"})
     assert real["grounded"] is True
     assert fake["grounded"] is False and "span_not_in_block" in fake["flags"]
+
+
+def test_saved_agent_report_becomes_a_review_queue(tmp_path):
+    ts = build_toolset(_doc(), _out())
+    ts.flag_for_review(
+        {
+            "region_id": REGION_ID,
+            "variable_name": "soil organic carbon",
+            "reason": "multi_row_block_needs_row_assignment",
+            "detail": "three rows need a human assignment",
+        }
+    )
+    result = run_agent(ts, ReplayPlanner())
+    report = tmp_path / "agent_run_PX.json"
+    report.write_text(result.model_dump_json(), encoding="utf-8")
+
+    queue = load_review_queue(report, study="PX")
+
+    assert queue.warning == ""
+    assert len(queue.flags) == 1
+    assert queue.flags[0].region_id == REGION_ID
+    assert queue.flags[0].reason == "multi_row_block_needs_row_assignment"
+
+
+def test_review_queue_rejects_report_for_another_paper(tmp_path):
+    report = tmp_path / "agent_run_PY.json"
+    report.write_text(json.dumps({"study": "PY"}), encoding="utf-8")
+
+    queue = load_review_queue(report, study="PX")
+
+    assert queue.flags == []
+    assert "Ignoring" in queue.warning
 
 
 def test_propose_then_commit_is_verified():
@@ -167,3 +202,75 @@ def test_tool_specs_are_function_call_ready():
     assert "$ref" not in blob and "$defs" not in blob  # Gemini rejects these
     for s in specs:
         assert s.name and s.description and s.parameters.get("type") == "object"
+
+
+def test_extract_values_is_only_advertised_with_a_live_tier3_client():
+    offline = {s.name for s in build_toolset(_doc(), _out()).specs()}
+    live = {s.name for s in build_toolset(_doc(), _out(), client=object()).specs()}
+    assert "extract_values" not in offline
+    assert "extract_values" in live
+
+
+class _FakeCompletions:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def _openai_response(*, tool_name=None, arguments="{}", content=None):
+    calls = []
+    if tool_name:
+        calls.append(
+            SimpleNamespace(
+                id="call-1",
+                type="function",
+                function=SimpleNamespace(name=tool_name, arguments=arguments),
+            )
+        )
+    message = SimpleNamespace(content=content, tool_calls=calls)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def test_openai_compatible_planner_maps_tools_calls_and_results():
+    completions = _FakeCompletions(
+        [
+            _openai_response(tool_name="list_regions"),
+            _openai_response(content="done"),
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    planner = OpenAICompatiblePlanner(client=client, model="provider-model")
+    specs = build_toolset(_doc(), _out()).specs()
+    planner.reset(system="rules", tools=specs, context="paper context")
+
+    action = planner.next_action(None)
+    assert action == ToolCall("list_regions", {})
+    assert completions.calls[0]["tools"][0]["type"] == "function"
+    assert completions.calls[0]["messages"][0] == {"role": "system", "content": "rules"}
+
+    finish = planner.next_action(
+        ToolResult(name="list_regions", content={"ok": True, "regions": []})
+    )
+    assert finish == Finish("done")
+    messages = completions.calls[1]["messages"]
+    assert messages[-2]["tool_calls"][0]["id"] == "call-1"
+    assert messages[-1]["tool_call_id"] == "call-1"
+    assert json.loads(messages[-1]["content"])["ok"] is True
+
+
+def test_agent_cli_creates_report_directory(tmp_path):
+    from metaextract import cockpit_cache
+    from metaextract.cli import main
+
+    cockpit_cache.save(tmp_path, "PX", _doc(), _out())
+    report = tmp_path / "outputs" / "nested" / "agent_run_PX.json"
+
+    assert main(["agent", "PX", "--root", str(tmp_path), "--report", str(report)]) == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["study"] == "PX"
+    assert payload["trace"]
+    assert load_review_queue(report, study="PX").warning == ""

@@ -2,19 +2,23 @@
 
 The loop is dumb on purpose: it dispatches whatever the planner asks for and
 enforces the gate inside the tools. The *policy* lives here, behind one small
-protocol, so the same tools and the same grounding gate can be driven by either:
+protocol, so the same core tools and grounding gate can be driven by:
 
 * :class:`ReplayPlanner` — a deterministic, offline policy that reacts to tool
   results (written as a generator, so it reads like a script while still being a
   real perceive→act loop). It needs no API key, so it runs the demo and the tests.
 * :class:`GeminiPlanner` — the live LLM policy using Gemini function-calling.
+* :class:`OpenAICompatiblePlanner` — one adapter for OpenAI-compatible tool-call
+  APIs, including DeepSeek.
 
-Both are constrained identically: neither can commit a number that fails grounding,
+All are constrained identically: none can commit a number that fails grounding,
 because that rule lives in the tools, not the planner.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Protocol, Union, runtime_checkable
 
@@ -225,3 +229,124 @@ class GeminiPlanner:
             if call is not None:
                 return ToolCall(name=call.name, args=dict(call.args or {}))
         return Finish(getattr(response, "text", "") or "model returned no tool call")
+
+
+class OpenAICompatiblePlanner:
+    """Live policy for providers that implement OpenAI-style chat tool calls.
+
+    Provider-specific details are configuration (model, base URL, API-key env),
+    not separate planner logic. DeepSeek and other compatible endpoints therefore
+    share this implementation.
+    """
+
+    def __init__(
+        self,
+        client: Any = None,
+        *,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        api_key_env: str = "OPENAI_API_KEY",
+    ) -> None:
+        self._client = client
+        self._model = model
+        self._base_url = base_url
+        self._api_key = api_key
+        self._api_key_env = api_key_env
+        self._messages: list[dict[str, Any]] = []
+        self._tools: list[dict[str, Any]] = []
+        self._pending_tool_call_id: Optional[str] = None
+
+    def reset(self, *, system: str, tools: list[ToolSpec], context: str) -> None:
+        if not self._model:
+            raise ValueError("an OpenAI-compatible planner requires a model id")
+        if self._client is None:
+            api_key = self._api_key or os.environ.get(self._api_key_env)
+            if not api_key:
+                raise RuntimeError(f"set {self._api_key_env} before running this provider")
+            try:
+                from openai import OpenAI
+            except ImportError as e:
+                raise RuntimeError(
+                    "install project dependencies before using an OpenAI-compatible provider"
+                ) from e
+            kwargs: dict[str, Any] = {"api_key": api_key}
+            if self._base_url:
+                kwargs["base_url"] = self._base_url
+            self._client = OpenAI(**kwargs)
+
+        self._messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": context},
+        ]
+        self._tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in tools
+        ]
+        self._pending_tool_call_id = None
+
+    def next_action(self, last: Optional[ToolResult]) -> AgentAction:
+        if last is not None:
+            if self._pending_tool_call_id is None:
+                raise RuntimeError("received a tool result without a pending tool call")
+            self._messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": self._pending_tool_call_id,
+                    "content": json.dumps(last.content, ensure_ascii=False, default=str),
+                }
+            )
+            self._pending_tool_call_id = None
+
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=self._messages,
+            tools=self._tools,
+            tool_choice="auto",
+        )
+        if not response.choices:
+            return Finish("model returned no choices")
+
+        message = response.choices[0].message
+        calls = list(getattr(message, "tool_calls", None) or [])
+        if not calls:
+            return Finish(getattr(message, "content", "") or "model returned no tool call")
+
+        # The agent loop executes one action per turn. Preserve exactly that call
+        # in history so the next tool response forms a valid request pair even if
+        # an endpoint returned several calls at once.
+        call = calls[0]
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": getattr(message, "content", None),
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": getattr(call, "type", "function"),
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    },
+                }
+            ],
+        }
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content:
+            assistant_message["reasoning_content"] = reasoning_content
+        self._messages.append(assistant_message)
+        self._pending_tool_call_id = call.id
+
+        try:
+            args = json.loads(call.function.arguments or "{}")
+        except (TypeError, json.JSONDecodeError):
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        return ToolCall(name=call.function.name, args=args)
