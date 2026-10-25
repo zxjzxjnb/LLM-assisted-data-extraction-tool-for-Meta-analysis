@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from metaextract import cockpit_cache, reviewstore  # noqa: E402
+from metaextract.agent import load_review_queue  # noqa: E402
 from metaextract.families import get_family  # noqa: E402
 from metaextract.highlight import Match, locate_value, locate_value_in_span, locate_values  # noqa: E402
 from metaextract.render import render_page, render_region  # noqa: E402
@@ -84,6 +85,11 @@ def _value_key(value: str) -> str:
 
 def _pdf_path(study: str) -> Path:
     return ROOT / "data" / "sample_papers" / f"{study}.pdf"
+
+
+def _agent_report_path(study: str) -> Path:
+    """The conventional hand-off file written by ``metaextract agent --report``."""
+    return ROOT / "data" / "outputs" / f"agent_run_{study}.json"
 
 
 def main() -> None:
@@ -151,7 +157,37 @@ def main() -> None:
         return
 
     labels = [f"{r.variable_name}  ·  {r.citation.block_id} (p{r.citation.page})" for r in out.regions]
-    idx = st.sidebar.radio("Located regions", range(len(out.regions)), format_func=lambda i: labels[i])
+    region_index = {r.region_id: i for i, r in enumerate(out.regions)}
+    region_key = f"selected_region_{scope}"
+    if region_key not in st.session_state:
+        st.session_state[region_key] = 0
+
+    # Agent flags are a hand-off, not an auto-acceptance path.  The reviewer gets
+    # the reason and can jump directly to the cited region in this same cockpit.
+    report_path = _agent_report_path(study)
+    agent_queue = load_review_queue(report_path, study=study)
+    if agent_queue.warning:
+        st.sidebar.warning(f"🤖 {agent_queue.warning}")
+    if agent_queue.flags:
+        st.sidebar.warning(f"🤖 Agent review queue: {len(agent_queue.flags)} item(s)")
+        with st.sidebar.expander("Open Agent flags", expanded=True):
+            st.caption(f"Source: {report_path.name}")
+            for i, flag in enumerate(agent_queue.flags):
+                target = region_index.get(flag.region_id or "")
+                title = flag.variable_name or flag.region_id or "Unspecified region"
+                st.markdown(f"**{title}**  \n`{flag.reason}`")
+                if flag.detail:
+                    st.caption(flag.detail)
+                if target is None:
+                    st.caption("This flagged region is not in the current cached paper.")
+                elif st.button("Open source region", key=f"agent_flag_{scope}_{i}"):
+                    st.session_state[region_key] = target
+                    st.rerun()
+
+    idx = st.sidebar.radio(
+        "Located regions", range(len(out.regions)),
+        format_func=lambda i: labels[i], key=region_key,
+    )
     region = out.regions[idx]
     block = doc.block(region.citation.block_id)
 
@@ -199,6 +235,11 @@ def main() -> None:
     with right:
         st.subheader(region.variable_name)
         st.caption(f"{region.citation.kind} · {region.citation.block_id} · page {region.citation.page}")
+        region_flags = [f for f in agent_queue.flags if f.region_id == region.region_id]
+        if region_flags:
+            with st.expander("🤖 Agent hand-off — review before adding a record", expanded=True):
+                for flag in region_flags:
+                    st.warning(f"{flag.reason}: {flag.detail or 'No further detail supplied.'}")
         if region.ambiguous:
             st.warning("Model marked this region ambiguous — verify it really holds this variable.")
 

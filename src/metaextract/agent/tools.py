@@ -320,7 +320,7 @@ class Toolset:
             },
             ["role", "value"],
         )
-        return [
+        specs = [
             ToolSpec("list_regions", "List the located target-variable regions for this paper.", _obj({}), self.list_regions),
             ToolSpec("read_block", "Read one source block's text and its numeric tokens.", _obj({"block_id": {"type": "string"}}, ["block_id"]), self.read_block),
             ToolSpec("infer_columns", "Count the value columns in a table block (label-free geometry).", _obj({"block_id": {"type": "string"}}, ["block_id"]), self.infer_columns),
@@ -351,12 +351,6 @@ class Toolset:
                 self.propose_values,
             ),
             ToolSpec(
-                "extract_values",
-                "LIVE Tier-3: have the model read a located block, then ground every value (needs API).",
-                _obj({"region_id": {"type": "string"}}, ["region_id"]),
-                self.extract_values,
-            ),
-            ToolSpec(
                 "commit_record",
                 "Assemble a VerifiedRecord from a region's grounded slots; status comes from the gate.",
                 _obj({"region_id": {"type": "string"}, "treatment_group": {"type": "string"}, "control_group": {"type": "string"}}, ["region_id"]),
@@ -370,6 +364,17 @@ class Toolset:
             ),
             ToolSpec("finish", "End the run when every located region has been handled.", _obj({"summary": {"type": "string"}}), self.finish),
         ]
+        if self.client is not None:
+            specs.insert(
+                7,
+                ToolSpec(
+                    "extract_values",
+                    "LIVE Gemini Tier-3: have the model read a located block, then ground every value.",
+                    _obj({"region_id": {"type": "string"}}, ["region_id"]),
+                    self.extract_values,
+                ),
+            )
+        return specs
 
 
 def _looks_numeric(token: str) -> bool:

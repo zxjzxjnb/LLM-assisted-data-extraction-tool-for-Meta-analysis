@@ -214,3 +214,8 @@ __marimo__/
 .claude/
 data/cache/
 data/reviews/
+
+# Generated outputs and local review reports
+data/outputs/
+*评审报告*.md
+*代码评审*.md

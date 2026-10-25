@@ -55,9 +55,25 @@ def main(argv: list[str] | None = None) -> int:
     p_agent.add_argument(
         "--online",
         action="store_true",
-        help="Use the live Gemini planner (needs an API key); default is the offline replay policy.",
+        help="Use the live Gemini planner; retained as a shortcut for --provider gemini.",
     )
-    p_agent.add_argument("--model", default=None, help="Gemini model id (online only).")
+    p_agent.add_argument(
+        "--provider",
+        choices=("gemini", "deepseek", "openai-compatible"),
+        default=None,
+        help="Live planner provider. Omit for the offline replay policy.",
+    )
+    p_agent.add_argument("--model", default=None, help="Live planner model id.")
+    p_agent.add_argument(
+        "--base-url",
+        default=None,
+        help="API base URL for an OpenAI-compatible provider.",
+    )
+    p_agent.add_argument(
+        "--api-key-env",
+        default=None,
+        help="Environment variable holding the provider API key.",
+    )
     p_agent.add_argument("--report", default=None, help="Optional JSON path for the full run.")
 
     args = parser.parse_args(argv)
@@ -96,7 +112,15 @@ def main(argv: list[str] | None = None) -> int:
         from pathlib import Path
 
         from . import cockpit_cache
-        from .agent import GeminiPlanner, ReplayPlanner, build_toolset, run_agent
+        import os
+
+        from .agent import (
+            GeminiPlanner,
+            OpenAICompatiblePlanner,
+            ReplayPlanner,
+            build_toolset,
+            run_agent,
+        )
 
         root = Path(args.root)
         try:
@@ -105,21 +129,61 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {e}", file=sys.stderr)
             return 1
 
-        if args.online:
-            toolset = build_toolset(doc, out, model=args.model)
-            planner = GeminiPlanner(model=args.model)
+        provider = args.provider or ("gemini" if args.online else None)
+        if provider == "gemini":
+            from .extractor import DEFAULT_MODEL, _build_client
+
+            try:
+                client = _build_client()
+            except (KeyError, RuntimeError, ValueError) as e:
+                print(f"ERROR: could not configure Gemini: {e}", file=sys.stderr)
+                return 2
+            model = args.model or os.environ.get("METAEXTRACT_AGENT_MODEL") or DEFAULT_MODEL
+            # Gemini can also power the nested Tier-3 extract_values tool, so the
+            # planner and toolset intentionally share one client.
+            toolset = build_toolset(doc, out, client=client, model=model)
+            planner = GeminiPlanner(client=client, model=model)
+        elif provider in {"deepseek", "openai-compatible"}:
+            if provider == "deepseek":
+                model = (
+                    args.model
+                    or os.environ.get("METAEXTRACT_AGENT_MODEL")
+                    or "deepseek-v4-flash"
+                )
+                base_url = (
+                    args.base_url
+                    or os.environ.get("METAEXTRACT_AGENT_BASE_URL")
+                    or "https://api.deepseek.com"
+                )
+                api_key_env = args.api_key_env or "DEEPSEEK_API_KEY"
+            else:
+                model = args.model or os.environ.get("METAEXTRACT_AGENT_MODEL")
+                base_url = args.base_url or os.environ.get("METAEXTRACT_AGENT_BASE_URL")
+                api_key_env = args.api_key_env or "OPENAI_API_KEY"
+            toolset = build_toolset(doc, out)
+            planner = OpenAICompatiblePlanner(
+                model=model,
+                base_url=base_url,
+                api_key_env=api_key_env,
+            )
         else:
             toolset = build_toolset(doc, out)  # offline: extract_values disabled
             planner = ReplayPlanner()
 
-        result = run_agent(toolset, planner)
+        try:
+            result = run_agent(toolset, planner)
+        except (KeyError, RuntimeError, ValueError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         print(result.summary_line())
         for f in result.flagged:
             print(f"  flagged: {f.variable_name or f.region_id} — {f.reason}")
         if args.report:
             import json
 
-            Path(args.report).write_text(
+            report_path = Path(args.report)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
                 json.dumps(result.model_dump(mode="json"), indent=2, ensure_ascii=False)
             )
             print(f"full run -> {args.report}")
