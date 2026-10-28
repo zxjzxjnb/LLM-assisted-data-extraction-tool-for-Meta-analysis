@@ -154,7 +154,13 @@ class Toolset:
     def find_sample_sizes(self, _args: dict) -> dict:
         cands = find_sample_size_candidates(self.doc)
         out = [
-            {"value": c.value, "phrase": c.phrase.strip("…").strip(), "block_id": c.block_id, "page": c.page}
+            {
+                "value": c.value,
+                "phrase": c.phrase.strip("…").strip(),
+                "evidence_text": c.evidence_text,
+                "block_id": c.block_id,
+                "page": c.page,
+            }
             for c in cands
         ]
         return {"ok": True, "candidates": out, "summary": f"{len(out)} n candidate(s)"}
@@ -169,7 +175,7 @@ class Toolset:
         if block is None:
             return {"ok": False, "summary": f"no block {args.get('block_id')!r}"}
         value = str(args.get("value", ""))
-        evidence = str(args.get("evidence_text") or value)
+        evidence = str(args.get("evidence_text") or "")
         gr = gate.verify(block, value, evidence)
         return {
             "ok": True,
@@ -181,9 +187,8 @@ class Toolset:
     def propose_values(self, args: dict) -> dict:
         """Submit values for one region; each is run through the grounding gate.
 
-        Grounded slots are stored against the region for ``commit_record``. Each
-        value's ``evidence_text`` defaults to the value itself, i.e. "this exact
-        printed number appears in the cited block" — the honest minimum.
+        Grounded slots are stored against the region for ``commit_record``. Every
+        value must include an explicitly quoted evidence span.
         """
         region = self._region(args.get("region_id", ""))
         if region is None:
@@ -192,16 +197,25 @@ class Toolset:
         if block is None:
             return {"ok": False, "summary": f"region's block {region.citation.block_id} missing"}
         raw_values = []
+        grounded_slots = []
         for v in args.get("values", []) or []:
             value = str(v.get("value", ""))
-            raw_values.append(
-                RawExtractedValue(
-                    role=str(v.get("role", "")),
-                    value=value,
-                    evidence_text=str(v.get("evidence_text") or value),
-                )
+            raw = RawExtractedValue(
+                role=str(v.get("role", "")),
+                value=value,
+                evidence_text=str(v.get("evidence_text") or ""),
             )
-        slots = apply_grounding(
+            cited_block = self._block(str(v.get("source_block_id") or "")) or block
+            # n is often stated in Methods rather than in the located data block.
+            # Let it carry its own cited block while retaining the same grounding
+            # implementation and role allow-list as table values.
+            if cited_block.block_id != block.block_id:
+                grounded_slots.extend(
+                    apply_grounding(Tier3Response(values=[raw]), cited_block, region, allowed_roles=self.family.roles)
+                )
+            else:
+                raw_values.append(raw)
+        slots = grounded_slots + apply_grounding(
             Tier3Response(values=raw_values), block, region, allowed_roles=self.family.roles
         )
         self._store_slots(region.region_id, slots)

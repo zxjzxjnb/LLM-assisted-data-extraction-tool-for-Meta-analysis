@@ -13,7 +13,8 @@ already exists*; all geometry (page, bbox) is attached afterwards from the
 SourceDoc by :func:`resolve_regions`. A block_id the model invents is dropped and
 reported, never given fabricated coordinates. ``build_payload`` and
 ``resolve_regions`` are pure and unit-tested without the API; :func:`locate` is a
-thin Gemini wrapper around them.
+thin provider wrapper around them. Gemini remains the default, while named
+profiles can use any OpenAI-compatible endpoint.
 """
 
 from __future__ import annotations
@@ -22,11 +23,12 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .families import DEFAULT_FAMILY, RESERVED_RECORD_KEYS, get_family
+from .model_profiles import ModelProfile
 from .records import Citation, ExtractedModerator, LocatedRegion, SampleSize, ScreeningResult
 from .sourcedoc import SourceDoc
 
@@ -230,7 +232,7 @@ SOIL_AGRI_SPEC = TaskSpec(
 )
 
 
-# --- what we ask Gemini to return (no geometry, just block_id choices) ---
+# --- what we ask the locator to return (no geometry, just block_id choices) ---
 class RawRegion(BaseModel):
     block_id: str
     variable_name: str
@@ -265,6 +267,9 @@ class LocatorResponse(BaseModel):
 class LocateOutput(BaseModel):
     screening: ScreeningResult
     regions: list[LocatedRegion]
+    # Full task vocabulary, retained so the cockpit can show missing variables
+    # even when the model omitted them from both screening and locate output.
+    target_variables: list[str] = Field(default_factory=list)
     moderators: list[ExtractedModerator] = Field(default_factory=list)
     moderator_fields: list[str] = Field(default_factory=list)  # full set, for the cockpit panel
     sample_size: Optional[SampleSize] = None
@@ -281,6 +286,19 @@ class LocateOutput(BaseModel):
     # progress by it so changing target metrics doesn't mix records. None on
     # caches written before stamping existed.
     task_stamp: Optional[str] = None
+    source_sha256: Optional[str] = None
+    # Provider metadata is persisted with the locate cache so a result can be
+    # reproduced and audited after a fallback or a model change.
+    profile: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    endpoint: Optional[str] = None
+    response_mode: Optional[str] = None
+    schema_hash: Optional[str] = None
+    prompt_hash: Optional[str] = None
+    fallback_used: bool = False
+    fallback_reasons: list[str] = Field(default_factory=list)
+    fallback_reason: Optional[str] = None
 
 
 def build_payload(doc: SourceDoc) -> str:
@@ -364,7 +382,10 @@ def _system_instruction(spec: TaskSpec) -> str:
 
 
 def resolve_regions(
-    doc: SourceDoc, raw: LocatorResponse, paper_id: str
+    doc: SourceDoc,
+    raw: LocatorResponse,
+    paper_id: str,
+    allowed_variables: dict[str, str] | None = None,
 ) -> tuple[list[LocatedRegion], list[str]]:
     """Attach real geometry to model-chosen block_ids; drop+report invented ones.
 
@@ -382,7 +403,17 @@ def resolve_regions(
                 f"{r.variable_name!r} (dropped — model may have invented it)"
             )
             continue
-        region_id = f"{paper_id}:{block.block_id}:{_slug(r.variable_name)}"
+        variable_name = r.variable_name.strip()
+        if allowed_variables is not None:
+            canonical = allowed_variables.get(variable_name.casefold())
+            if canonical is None:
+                problems.append(
+                    f"unknown target variable {r.variable_name!r} in block "
+                    f"{r.block_id!r} (dropped)"
+                )
+                continue
+            variable_name = canonical
+        region_id = f"{paper_id}:{block.block_id}:{_slug(variable_name)}"
         if region_id in seen:
             continue
         seen.add(region_id)
@@ -390,7 +421,7 @@ def resolve_regions(
             LocatedRegion(
                 region_id=region_id,
                 paper_id=paper_id,
-                variable_name=r.variable_name,
+                variable_name=variable_name,
                 citation=Citation(
                     block_id=block.block_id,
                     page=block.page,
@@ -404,21 +435,28 @@ def resolve_regions(
     return regions, problems
 
 
-def resolve_moderators(doc: SourceDoc, raw: LocatorResponse) -> list[ExtractedModerator]:
+def resolve_moderators(
+    doc: SourceDoc,
+    raw: LocatorResponse,
+    allowed_fields: dict[str, str] | None = None,
+) -> list[ExtractedModerator]:
     """Keep each moderator value; attach a citation when its block_id is real."""
     mods: list[ExtractedModerator] = []
     seen: set[str] = set()
     for m in raw.moderators:
-        if not m.value or _slug(m.field) in seen:
+        field = m.field.strip()
+        if allowed_fields is not None:
+            field = allowed_fields.get(field.casefold(), "")
+        if not m.value or not field or _slug(field) in seen:
             continue
-        seen.add(_slug(m.field))
+        seen.add(_slug(field))
         block = doc.block(m.block_id) if m.block_id else None
         citation = (
             Citation(block_id=block.block_id, page=block.page, bbox=block.bbox, kind=block.kind)
             if block is not None
             else None
         )
-        mods.append(ExtractedModerator(field=m.field, value=m.value, citation=citation))
+        mods.append(ExtractedModerator(field=field, value=m.value, citation=citation))
     return mods
 
 
@@ -444,31 +482,82 @@ def locate(
     spec: TaskSpec = SOIL_AGRI_SPEC,
     model: Optional[str] = None,
     client=None,
+    profile: ModelProfile | dict[str, Any] | None = None,
+    profile_name: str | None = None,
 ) -> LocateOutput:
-    """Run Tier 1 + Tier 2 over an ingested SourceDoc via Gemini structured output."""
-    from google.genai import types
+    """Run Tier 1 + Tier 2 over an ingested SourceDoc.
 
-    from .extractor import DEFAULT_MODEL, _build_client
+    With no ``profile`` this keeps the original Gemini client behavior.  A
+    profile with ``transport: openai_compatible`` uses one-shot chat completion
+    with the selected JSON response mode, so hosted and local compatible APIs
+    share the same locator validation and region resolution.
+    """
+    if isinstance(profile, dict):
+        profile = ModelProfile.model_validate(profile)
 
-    client = client or _build_client()
-    response = client.models.generate_content(
-        model=model or DEFAULT_MODEL,
-        contents=[build_payload(doc)],
-        config=types.GenerateContentConfig(
-            system_instruction=_system_instruction(spec),
-            temperature=0.0,
-            response_mime_type="application/json",
-            response_schema=_response_schema(),
-        ),
+    active_model = model or (profile.model if profile else None)
+    provider = profile.transport if profile else "gemini"
+    endpoint = profile.resolved_endpoint if profile else None
+    requested_response_mode = profile.response_mode if profile else "auto"
+    actual_response_mode = requested_response_mode
+
+    system = _system_instruction(spec)
+    payload = build_payload(doc)
+    schema = _response_schema()
+    if profile and profile.transport == "openai_compatible":
+        parsed, actual_response_mode = _openai_locator_call(
+            profile,
+            system=system,
+            payload=payload,
+            schema=schema,
+            client=client,
+            model=active_model,
+        )
+        raw = LocatorResponse.model_validate(parsed)
+    else:
+        from google.genai import types
+
+        from .extractor import DEFAULT_MODEL, _build_client
+
+        if client is None:
+            if profile and (profile.api_key or (
+                profile.api_key_value() and profile.resolved_api_key_env != "GOOGLE_API_KEY"
+            )):
+                from google import genai
+
+                client = genai.Client(api_key=profile.api_key_value())
+            else:
+                client = _build_client()
+        active_model = active_model or DEFAULT_MODEL
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system,
+            "temperature": 0.0,
+            "response_mime_type": "application/json",
+        }
+        if requested_response_mode in {"auto", "json_schema"}:
+            config_kwargs["response_schema"] = schema
+        response = client.models.generate_content(
+            model=active_model or DEFAULT_MODEL,
+            contents=[payload],
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        parsed = getattr(response, "parsed", None)
+        raw = (
+            LocatorResponse.model_validate(parsed)
+            if parsed is not None
+            else LocatorResponse.model_validate_json(response.text)
+        )
+
+    regions, problems = resolve_regions(
+        doc,
+        raw,
+        doc.doc_id,
+        allowed_variables={
+            name.casefold(): name
+            for tv in spec.target_variables
+            for name in [tv.name, *tv.aliases]
+        },
     )
-    parsed = getattr(response, "parsed", None)
-    raw = (
-        LocatorResponse.model_validate(parsed)
-        if parsed is not None
-        else LocatorResponse.model_validate_json(response.text)
-    )
-
-    regions, problems = resolve_regions(doc, raw, doc.doc_id)
     screening = ScreeningResult(
         paper_id=doc.doc_id,
         include=raw.include,
@@ -479,18 +568,156 @@ def locate(
     return LocateOutput(
         screening=screening,
         regions=regions,
-        moderators=resolve_moderators(doc, raw),
+        target_variables=spec.variable_names,
+        moderators=resolve_moderators(
+            doc,
+            raw,
+            allowed_fields={field.casefold(): field for field in spec.moderators},
+        ),
         moderator_fields=spec.moderators,
         sample_size=resolve_sample_size(doc, raw),
         problems=problems,
         task_stamp=spec.cache_stamp,
         analysis_family=spec.analysis_family,
         record_covariates=spec.record_covariates,
+        source_sha256=doc.source_sha256,
+        profile=profile_name,
+        provider=provider,
+        model=active_model,
+        endpoint=endpoint,
+        response_mode=actual_response_mode,
+        schema_hash=_short_hash(schema),
+        prompt_hash=_short_hash({"system": system, "payload": payload}),
     )
 
 
+def _short_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _response_text(response: Any) -> str:
+    """Extract assistant text from OpenAI SDK objects and simple test doubles."""
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        raise RuntimeError("compatible model returned no choices")
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+            else:
+                text = getattr(item, "text", None)
+            if text:
+                parts.append(str(text))
+        if parts:
+            return "".join(parts)
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False)
+    raise RuntimeError("compatible model returned an empty message")
+
+
+def _parse_json_response(text: str) -> LocatorResponse:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return LocatorResponse.model_validate_json(cleaned)
+
+
+def _openai_locator_call(
+    profile: ModelProfile,
+    *,
+    system: str,
+    payload: str,
+    schema: dict[str, Any],
+    client=None,
+    model: str | None,
+) -> tuple[LocatorResponse, str]:
+    """Call an OpenAI-compatible endpoint and validate its structured output.
+
+    ``auto`` first asks for JSON Schema and retries once with JSON Object when an
+    endpoint rejects that response format.  This is a protocol compatibility
+    retry, not a model fallback; fallback profiles are orchestrated by
+    ``prepare_paper`` and are therefore still opt-in.
+    """
+    if not model:
+        raise ValueError("an OpenAI-compatible locator profile requires a model id")
+    if client is None:
+        api_key = profile.api_key_value()
+        if not api_key:
+            raise RuntimeError(f"set {profile.resolved_api_key_env} before using this profile")
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError("install project dependencies before using an OpenAI-compatible profile") from exc
+        kwargs: dict[str, Any] = {"api_key": api_key}
+        if profile.resolved_endpoint:
+            kwargs["base_url"] = profile.resolved_endpoint
+        client = OpenAI(**kwargs)
+
+    modes = ["json_schema", "json_object"] if profile.response_mode == "auto" else [profile.response_mode]
+    strict_schema = _strict_openai_schema(schema)
+    last_error: Exception | None = None
+    for mode in modes:
+        request: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system + "\nReturn only a JSON object."},
+                {"role": "user", "content": payload},
+            ],
+            "temperature": 0.0,
+        }
+        if mode == "json_schema":
+            request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "locator_response", "strict": True, "schema": strict_schema},
+            }
+        else:
+            request["response_format"] = {"type": "json_object"}
+        try:
+            response = client.chat.completions.create(**request)
+            return _parse_json_response(_response_text(response)), mode
+        except Exception as exc:
+            last_error = exc
+            if profile.response_mode != "auto":
+                break
+    raise RuntimeError(f"compatible locator request failed for profile model {model!r}: {last_error}") from last_error
+
+
+def _strict_openai_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Make the Pydantic schema acceptable to strict OpenAI-style APIs.
+
+    Strict response formats require every object property to be listed in
+    ``required`` and reject additional keys. Optional Pydantic fields already
+    carry a nullable branch where needed; defaults such as ``ambiguous`` are
+    simply emitted by the model when the field is required.
+    """
+    if isinstance(schema, list):
+        return [_strict_openai_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    # ``default`` and ``title`` are useful documentation in Pydantic's schema
+    # but are outside the portable strict-response subset used by many hosted
+    # compatible APIs.
+    result = {
+        key: _strict_openai_schema(value)
+        for key, value in schema.items()
+        if key not in {"default", "title"}
+    }
+    if result.get("type") == "object" or "properties" in result:
+        properties = result.get("properties", {})
+        result["required"] = list(properties)
+        result["additionalProperties"] = False
+    return result
+
+
 def _response_schema() -> dict:
-    """Inline $defs/$ref, which Gemini's response_schema does not accept."""
+    """Inline $defs/$ref for providers that require a flat JSON schema."""
     schema = LocatorResponse.model_json_schema()
     defs = schema.pop("$defs", {})
 

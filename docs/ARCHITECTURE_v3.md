@@ -341,8 +341,9 @@ manufactures false bindings in multi-site / multi-soil / multi-depth papers
     [records.py](../src/metaextract/records.py) three-layer model;
     [test_locate.py](../tests/test_locate.py)). `build_payload` +
     `resolve_regions` (the C1 guard: invented `block_id`s are dropped+reported,
-    never given coordinates) are deterministic and tested. The Gemini call is a
-    thin wrapper, **pending an API key** for a live run.
+    never given coordinates) are deterministic and tested. Gemini remains the
+    default transport; `prepare_paper.py` can select a named OpenAI-compatible
+    profile with explicit endpoint, model, response mode, and optional fallback.
   - Streamlit cockpit: PDF + worksheet, **click-to-jump-and-highlight**, human
     fill + pair, export `meta_ready.csv`. ✅ *Done* ([app/cockpit.py](../app/cockpit.py),
     [render.py](../src/metaextract/render.py),

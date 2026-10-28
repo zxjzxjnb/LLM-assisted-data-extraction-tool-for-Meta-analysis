@@ -30,6 +30,7 @@ _PATTERNS: list[tuple[str, Callable[[re.Match], str]]] = [
 class NCandidate(BaseModel):
     value: str
     phrase: str  # the surrounding text, so the human can judge
+    evidence_text: str = ""  # exact substring in the source block, without UI ellipses
     block_id: str
     page: int
 
@@ -53,6 +54,7 @@ def find_sample_size_candidates(doc: SourceDoc, ctx: int = 45) -> list[NCandidat
                     NCandidate(
                         value=value,
                         phrase=("…" + b.text[s:e].strip() + "…"),
+                        evidence_text=b.text[s:e].strip(),
                         block_id=b.block_id,
                         page=b.page,
                     )

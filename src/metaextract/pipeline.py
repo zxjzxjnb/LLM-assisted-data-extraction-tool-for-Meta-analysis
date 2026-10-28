@@ -18,6 +18,8 @@ import pandas as pd
 from .extractor import DEFAULT_MODEL, extract_from_pdf, _build_client
 from .families import DEFAULT_FAMILY
 from .flatten import result_to_rows
+from .flatten import FLAT_COLUMNS
+from .fileio import atomic_write_text
 from .locate import TaskSpec
 
 
@@ -89,10 +91,24 @@ def run_folder(
             "uses the fixed continuous mean/SD/n schema."
         )
 
-    client = _build_client()
     cache = Path(cache_dir) if cache_dir else None
     if cache:
         cache.mkdir(parents=True, exist_ok=True)
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    if not pdfs:
+        atomic_write_text(
+            output_csv,
+            pd.DataFrame(columns=FLAT_COLUMNS).to_csv(index=False),
+            encoding="utf-8-sig",
+        )
+        atomic_write_text(
+            output_csv.parent / "run_summary.json",
+            json.dumps(summary.as_dict(), indent=2),
+        )
+        return summary
+
+    client = _build_client()
 
     if task_spec is not None:
         print(
@@ -113,7 +129,7 @@ def run_folder(
             else:
                 result = _extract_with_retry(pdf, client, model, task_spec=task_spec)
                 if cache_file:
-                    cache_file.write_text(result.model_dump_json(indent=2))
+                    atomic_write_text(cache_file, result.model_dump_json(indent=2))
 
             rows = result_to_rows(result, pdf.name)
             all_rows.extend(rows)
@@ -126,10 +142,14 @@ def run_folder(
             summary.errors[pdf.name] = str(e)
             print(f"[fail] {pdf.name}: {e}")
 
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(all_rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
-    (output_csv.parent / "run_summary.json").write_text(
-        json.dumps(summary.as_dict(), indent=2)
+    atomic_write_text(
+        output_csv,
+        pd.DataFrame(all_rows).to_csv(index=False),
+        encoding="utf-8-sig",
+    )
+    atomic_write_text(
+        output_csv.parent / "run_summary.json",
+        json.dumps(summary.as_dict(), indent=2),
     )
     print(
         f"\nDone: {summary.succeeded}/{summary.total} papers, "

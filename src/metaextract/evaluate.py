@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 
 import pandas as pd
 
@@ -43,6 +44,10 @@ def _row_key(row) -> tuple:
         _norm(row.get("variable_name")),
         _norm(row.get("treatment_group")),
         _norm(row.get("control_group")),
+        _norm(row.get("sampling_depth_cm") or row.get("depth")),
+        _norm(row.get("measurement_year")),
+        _norm(row.get("site_name") or row.get("site")),
+        _norm(row.get("experiment_id")),
     )
 
 
@@ -65,9 +70,11 @@ def evaluate(pred_csv, truth_csv, rel_tol: float = 0.05) -> dict:
     pred = pd.read_csv(pred_csv).to_dict("records")
     truth = pd.read_csv(truth_csv).to_dict("records")
 
-    pred_by_key: dict[tuple, dict] = {}
+    # Keep all rows per identity. A dict[key] = row silently overwrites duplicate
+    # depths/time points and lets one prediction match multiple truth rows.
+    pred_by_key: dict[tuple, list[dict]] = defaultdict(list)
     for r in pred:
-        pred_by_key.setdefault(_row_key(r), r)
+        pred_by_key[_row_key(r)].append(r)
 
     matched = 0
     field_total = {f: 0 for f in NUMERIC_FIELDS}
@@ -76,7 +83,13 @@ def evaluate(pred_csv, truth_csv, rel_tol: float = 0.05) -> dict:
 
     for t in truth:
         key = _row_key(t)
-        p = pred_by_key.get(key)
+        for f in NUMERIC_FIELDS:
+            tv = t.get(f)
+            if tv is None or (isinstance(tv, float) and math.isnan(tv)):
+                continue
+            field_total[f] += 1
+        candidates = pred_by_key.get(key, [])
+        p = candidates.pop(0) if candidates else None
         if p is None:
             continue
         matched += 1
@@ -84,7 +97,6 @@ def evaluate(pred_csv, truth_csv, rel_tol: float = 0.05) -> dict:
             tv = t.get(f)
             if tv is None or (isinstance(tv, float) and math.isnan(tv)):
                 continue
-            field_total[f] += 1
             pv = p.get(f)
             if _close(pv, tv, rel_tol):
                 field_correct[f] += 1

@@ -91,6 +91,8 @@ def ground_verify(value: str, evidence_text: str, block: SourceBlock) -> Groundi
     if not (evidence_text and evidence_text.strip()):
         return GroundingResult(verified=False, flags=["no_evidence_span"])
     flags: list[str] = []
+    if parse_number(value) is None:
+        flags.append("non_numeric_value")
     if not numeric_in_text(value, evidence_text):
         flags.append("value_not_in_span")  # A failed: claimed number isn't in its own span
     if not text_contains(block.text, evidence_text):

@@ -28,6 +28,12 @@ def test_save_overwrites_not_appends(tmp_path):
     assert len(reviewstore.load_draft(tmp_path, "P1")["records"]) == 2
 
 
+def test_empty_save_clears_deleted_last_record(tmp_path):
+    reviewstore.save_draft(tmp_path, "P1", [{"a": 1}], {})
+    reviewstore.save_draft(tmp_path, "P1", [], {})
+    assert reviewstore.load_draft(tmp_path, "P1")["records"] == []
+
+
 def test_drafts_are_isolated_per_study(tmp_path):
     reviewstore.save_draft(tmp_path, "P1", [{"a": 1}], {})
     reviewstore.save_draft(tmp_path, "P2", [{"b": 2}, {"c": 3}], {})

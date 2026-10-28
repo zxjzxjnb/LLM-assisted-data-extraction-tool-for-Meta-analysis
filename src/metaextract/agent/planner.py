@@ -98,6 +98,9 @@ class ReplayPlanner:
     def _script(self) -> Iterator[AgentAction]:
         res = yield ToolCall("list_regions", {})
         regions = res.content.get("regions", []) if res else []
+        nres = yield ToolCall("find_sample_sizes", {})
+        n_candidates = nres.content.get("candidates", []) if nres else []
+        n_candidate = n_candidates[0] if n_candidates else None
         for r in regions:
             rid, bid, var = r["region_id"], r["block_id"], r["variable_name"]
             if r.get("kind") == "figure":
@@ -144,13 +147,29 @@ class ReplayPlanner:
                 )
                 continue
             # Make the gate visible: a real printed value grounds, a fabricated one is rejected.
-            yield ToolCall("ground_check", {"block_id": bid, "value": cand["mean_c"]})
-            yield ToolCall("ground_check", {"block_id": bid, "value": "99999.0"})
+            yield ToolCall(
+                "ground_check",
+                {"block_id": bid, "value": cand["mean_c"], "evidence_text": cand["mean_c"]},
+            )
+            yield ToolCall(
+                "ground_check",
+                {"block_id": bid, "value": "99999.0", "evidence_text": "99999.0"},
+            )
             values = [
-                {"role": role, "value": cand[role]}
+                {"role": role, "value": cand[role], "evidence_text": cand[role]}
                 for role in ("mean_c", "sd_c", "mean_t", "sd_t")
                 if cand.get(role)
             ]
+            if n_candidate is not None:
+                values.extend(
+                    {
+                        "role": role,
+                        "value": n_candidate["value"],
+                        "evidence_text": n_candidate.get("evidence_text") or n_candidate.get("phrase", ""),
+                        "source_block_id": n_candidate["block_id"],
+                    }
+                    for role in ("n_c", "n_t")
+                )
             yield ToolCall("propose_values", {"region_id": rid, "values": values})
             yield ToolCall(
                 "commit_record",

@@ -15,6 +15,7 @@ of this geometry later, not a deterministic-ingest one.
 from __future__ import annotations
 
 import re
+import hashlib
 from pathlib import Path
 
 from .sourcedoc import BBox, SourceBlock, SourceDoc, Word
@@ -65,6 +66,7 @@ def ingest_pdf(pdf_path: str | Path) -> SourceDoc:
         n_pages=len(page_sizes),
         page_sizes=page_sizes,
         blocks=blocks,
+        source_sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
     )
 
 

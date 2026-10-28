@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from _gt import ROOT, gt_spec_and_truth
+from _gt import ROOT
 from eval_against_gt import _num, gt_records
 
 
@@ -72,8 +72,10 @@ def bench_paper(study):
         pred_sds = [_num(c.dispersion.text) for c in row.cells.values() if c.dispersion]
         gmeans = [v for v in vals["means"] if v is not None]
         gsds = [v for v in vals["sds"] if v is not None]
-        mean_ok += _recall(gmeans, pred_means); mean_tot += len(gmeans)
-        sd_ok += _recall(gsds, pred_sds); sd_tot += len(gsds)
+        mean_ok += _recall(gmeans, pred_means)
+        mean_tot += len(gmeans)
+        sd_ok += _recall(gsds, pred_sds)
+        sd_tot += len(gsds)
     return mean_ok, mean_tot, sd_ok, sd_tot
 
 

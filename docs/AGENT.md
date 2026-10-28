@@ -49,7 +49,7 @@ flowchart TB
 
     T4 --> GATE
     T5 --> GATE
-    GATE{"Grounding gate<br/>extract.ground_verify<br/>value ⊆ span ⊆ block"}
+GATE{"Grounding gate<br/>extract.ground_verify<br/>complete tokens in span ⊆ block"}
     GATE -->|pass| REC["VerifiedRecord<br/>status = verified"]
     GATE -->|fail| FLAG["needs_review / flagged"]
 
@@ -105,6 +105,10 @@ The grounding gate catches the failures the model's own confidence cannot:
   cited block) → rejected
 - a non-numeric value painted as a measurement → rejected
 
+For a record to be `verified`, every required field in the selected analysis
+family must also be present. This is still a grounding status, not a proof of
+correct row/column identity or human approval.
+
 It does **not** catch a number that is real but assigned to the **wrong row** —
 e.g. a block that merges `pH + Moisture + Total N` into one region, where the
 first row's (real) values could be handed to all three variables. The number
@@ -142,11 +146,11 @@ For another OpenAI-compatible API, pass `--provider openai-compatible`, its
 `METAEXTRACT_AGENT_BASE_URL` provide environment-based defaults; `--api-key-env`
 selects the key variable when it is not `OPENAI_API_KEY`.
 
-On cached P1 the offline run commits the clean single-row tables as `verified`
-records (their values matching the hand-extracted ground truth) and flags the
-merged `pH/Moisture/TN` block for human row-assignment — a faithful demonstration
-of the gate accepting grounded values, rejecting a fabricated probe, and the
-policy deferring the matching it should not automate.
+On cached P1 the offline run can assemble candidate records, but records without
+all required fields (including sample sizes for the continuous family) remain
+`needs_review`; the merged `pH/Moisture/TN` block is also flagged for human
+row-assignment. This demonstrates the gate rejecting fabricated or incomplete
+values while deferring identity matching it should not automate.
 
 ## Relationship to the rest of the system
 

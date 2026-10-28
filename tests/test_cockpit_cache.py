@@ -1,6 +1,7 @@
 """Cockpit cache isolation across task packs / analysis families."""
 
 import json
+import hashlib
 
 import pytest
 
@@ -150,3 +151,18 @@ def test_stamped_save_supersedes_a_stale_legacy_cache(tmp_path):
     assert [(e.study, e.stamp) for e in entries] == [("P1", "soil.aaa")]  # no duplicate
     _doc1, out = cockpit_cache.load(root, "P1")  # stampless eval-script call
     assert out.task_stamp == "soil.aaa"  # fresh, not stale
+
+
+def test_load_rejects_a_changed_source_pdf(tmp_path):
+    pdf_dir = tmp_path / "data" / "sample_papers"
+    pdf_dir.mkdir(parents=True)
+    pdf = pdf_dir / "P1.pdf"
+    pdf.write_bytes(b"source-a")
+    digest = hashlib.sha256(b"source-a").hexdigest()
+    doc = _doc("P1").model_copy(update={"source_sha256": digest})
+    out = _out("P1", "soil.aaa").model_copy(update={"source_sha256": digest})
+    cockpit_cache.save(tmp_path, "P1", doc, out)
+
+    pdf.write_bytes(b"source-b")
+    with pytest.raises(cockpit_cache.CacheError, match="changed after ingest"):
+        cockpit_cache.load(tmp_path, "P1", stamp="soil.aaa")

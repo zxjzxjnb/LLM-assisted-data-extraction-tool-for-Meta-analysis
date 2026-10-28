@@ -23,11 +23,17 @@ sys.path.insert(0, str(ROOT / "src"))
 from metaextract import cockpit_cache, reviewstore  # noqa: E402
 from metaextract.agent import load_review_queue  # noqa: E402
 from metaextract.families import get_family  # noqa: E402
-from metaextract.highlight import Match, locate_value, locate_value_in_span, locate_values  # noqa: E402
+from metaextract.highlight import Match, locate_value_in_span, locate_values  # noqa: E402
 from metaextract.render import render_page, render_region  # noqa: E402
 from metaextract.sampling import find_sample_size_candidates  # noqa: E402
 from metaextract.sourcedoc import BBox, SourceBlock  # noqa: E402
+from metaextract.records import Citation, LocatedRegion  # noqa: E402
 from metaextract.tabular import make_pairings, parse_block  # noqa: E402
+from metaextract.review_validation import (  # noqa: E402
+    target_variable_coverage,
+    validate_record,
+    validate_records_for_export,
+)
 
 st.set_page_config(page_title="MetaExtract cockpit", layout="wide")
 
@@ -111,10 +117,18 @@ def main() -> None:
         st.stop()
     # The analysis family drives the whole input form (which numbers a record
     # holds). Older caches have no family and default to continuous (today's form).
-    family = get_family(getattr(out, "analysis_family", None))
+    try:
+        family = get_family(getattr(out, "analysis_family", None))
+    except KeyError as e:
+        st.error(f"⚠ Invalid analysis family in cache: {e}. Re-run prepare_paper.py.")
+        st.stop()
     # Per-record covariates declared by the task pack (e.g. depth, fraction). Empty
     # on caches prepared before covariates existed, so the form looks unchanged.
     covariates = list(getattr(out, "record_covariates", []) or [])
+    # These fields form the row identity used to bind site/experiment/time
+    # context.  Depth declared by a task pack joins the same identity rather
+    # than being treated as a paper-level moderator.
+    identity_fields = ["site", "experiment", "time", *covariates]
     # Resume: seed this session's records from the saved draft (autosaved below).
     # Keyed by the task pack stamp so records assembled under different target
     # metrics never mix (matches the extract cache's filename stamping).
@@ -131,6 +145,10 @@ def main() -> None:
         st.error(f"⚠ {st.session_state[err_key]}")
     records = st.session_state.setdefault(f"records_{study}_{stamp}", draft["records"])
     saved_mods = draft.get("moderators", {})
+    coverage_status = draft.get("coverage_status", {})
+    override_key = f"screening_override_{scope}"
+    if override_key not in st.session_state:
+        st.session_state[override_key] = bool(draft.get("screening_override", False))
 
     # --- Tier 1 screening summary ---
     s = out.screening
@@ -138,22 +156,89 @@ def main() -> None:
     st.sidebar.markdown(f"**Variables found:** {len(s.target_variables_present)}")
     st.sidebar.markdown(f"**Moderators:** {', '.join(s.moderators_present) or '—'}")
     st.sidebar.caption(f"📐 Family: {family.label}")
+    expected_variables = list(getattr(out, "target_variables", []) or [])
+    if not expected_variables:
+        expected_variables = list(s.target_variables_present)
+    coverage = target_variable_coverage(
+        expected_variables,
+        [r.variable_name for r in out.regions],
+        screened_present=s.target_variables_present,
+    )
+    missing_coverage = [row for row in coverage if row["status"] != "located"]
+    with st.sidebar.expander(
+        f"Target coverage · {len(expected_variables) - len(missing_coverage)}/{len(expected_variables)} located",
+        expanded=bool(missing_coverage),
+    ):
+        if coverage:
+            st.dataframe(
+                pd.DataFrame(coverage)[["variable_name", "status", "located_count"]],
+                hide_index=True,
+                width="stretch",
+            )
+        if missing_coverage:
+            st.warning("Review every missing target before treating this paper as complete.")
     if out.problems:
         st.sidebar.error(f"{len(out.problems)} hallucinated block_id(s) dropped")
     st.sidebar.metric("Records assembled", len(records))
 
+    if not out.screening.include:
+        st.warning("🚫 The locator screened this paper out.")
+        st.caption(out.screening.reason or "No screening reason was recorded.")
+        st.session_state[override_key] = st.checkbox(
+            "Override screening and review this paper manually",
+            value=st.session_state[override_key],
+            key=f"screening_override_checkbox_{scope}",
+        )
+        if not st.session_state[override_key]:
+            st.info("The paper remains excluded until a reviewer overrides the decision.")
+            reviewstore.save_draft(
+                ROOT, study, records, saved_mods, stamp=stamp,
+                screening_override=False, coverage_status=coverage_status,
+            )
+            return
+        st.warning("Manual screening override is active; all missing target variables remain review items.")
+
     if not out.regions:
         # An excluded paper is the Tier-1 screen working, not a broken view — show
         # the verdict and the model's reason so it reads as "correctly skipped".
-        if not out.screening.include:
-            st.warning("🚫 This paper was screened **out** as off-topic for this meta-analysis.")
-            if out.screening.reason:
-                st.caption(f"Why: {out.screening.reason}")
-            st.info("That is the screening step doing its job. Pick an included paper "
-                    "(e.g. **P1**) from the sidebar to see located evidence.")
-        else:
-            st.info("This paper was included, but no regions were located. Try re-running "
-                    "`python scripts/prepare_paper.py` for it, or pick another paper.")
+        st.info("No regions were located. Use the coverage table to identify missing targets, "
+                "then re-run location or add a manual region from the source document.")
+        missing_targets = [row["variable_name"] for row in coverage if row["status"] != "located"]
+        paragraph_blocks = [b for b in doc.blocks if b.kind == "paragraph"]
+        if missing_targets and paragraph_blocks:
+            st.markdown("**Add a manually located target region**")
+            target = st.selectbox("Target variable", missing_targets, key=f"manual_target_{scope}")
+            source_block = st.selectbox(
+                "Source block",
+                paragraph_blocks,
+                format_func=lambda b: f"{b.block_id} · p{b.page} · {b.text[:80]}",
+                key=f"manual_block_{scope}",
+            )
+            if st.button("Add manual region", key=f"manual_region_{scope}"):
+                slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in target).strip("_")
+                out.regions.append(
+                    LocatedRegion(
+                        region_id=f"{doc.doc_id}:{source_block.block_id}:{slug}",
+                        paper_id=doc.doc_id,
+                        variable_name=target,
+                        citation=Citation(
+                            block_id=source_block.block_id,
+                            page=source_block.page,
+                            bbox=source_block.bbox,
+                            kind=source_block.kind,
+                        ),
+                    )
+                )
+                reviewstore.append_log(
+                    ROOT, study, "add_manual_region", variable_name=target,
+                    records_after=len(records), stamp=stamp,
+                )
+                cockpit_cache.save(ROOT, study, doc, out)
+                st.rerun()
+        reviewstore.save_draft(
+            ROOT, study, records, saved_mods, stamp=stamp,
+            screening_override=st.session_state[override_key], coverage_status=coverage_status,
+        )
         return
 
     labels = [f"{r.variable_name}  ·  {r.citation.block_id} (p{r.citation.page})" for r in out.regions]
@@ -190,21 +275,53 @@ def main() -> None:
     )
     region = out.regions[idx]
     block = doc.block(region.citation.block_id)
+    if block is None:
+        st.error(
+            f"⚠ Cached region refers to missing block {region.citation.block_id!r}. "
+            "Re-run prepare_paper.py for this paper."
+        )
+        return
 
     # --- moderators (paper-level): AI suggests, human confirms + binds (v3.1 §2) ---
     mod_ai = {m.field: m.value for m in out.moderators}
     mod_fields = out.moderator_fields or list(mod_ai)
-    with st.expander(f"📋 Moderators (paper-level) — {len(mod_ai)} AI-suggested · bind to all records"):
+    bound_key = f"bound_mods_{scope}"
+    if bound_key not in st.session_state:
+        st.session_state[bound_key] = dict(saved_mods)
+    with st.expander(f"📋 Moderators (paper-level suggestions) — {len(mod_ai)} AI-suggested"):
         st.caption(
-            "AI suggested these paper/site-level values; edit/confirm. They bind to every "
-            "exported record (v3.1 §2: AI may suggest, binding is human)."
+            "AI suggestions are shown for reference. Edit values if needed, then click "
+            "Confirm and bind; opening this page alone does not bind them."
         )
         mod_values: dict[str, str] = {}
         mcols = st.columns(3)
         for i, f in enumerate(mod_fields):
-            default = saved_mods.get(f) or mod_ai.get(f, "")  # saved draft wins over AI suggestion
-            mod_values[f] = mcols[i % 3].text_input(f, value=default, key=f"mod_{scope}_{f}")
-    bound = {k: v.strip() for k, v in mod_values.items() if v.strip()}
+            suggestion = mod_ai.get(f)
+            if suggestion:
+                mcols[i % 3].caption(f"AI suggestion: {suggestion}")
+            mod_values[f] = mcols[i % 3].text_input(
+                f,
+                value=st.session_state[bound_key].get(f, ""),
+                key=f"mod_{scope}_{f}",
+            )
+        if st.button("Confirm and bind moderators", key=f"bind_mods_{scope}"):
+            st.session_state[bound_key] = {
+                k: v.strip() for k, v in mod_values.items() if v.strip()
+            }
+            reviewstore.append_log(
+                ROOT, study, "bind_moderators", records_after=len(records), stamp=stamp
+            )
+            reviewstore.save_draft(
+                ROOT,
+                study,
+                records,
+                st.session_state[bound_key],
+                stamp=stamp,
+                screening_override=st.session_state.get(override_key, False),
+                coverage_status=coverage_status,
+            )
+            st.rerun()
+    bound = dict(st.session_state[bound_key])
 
     # --- sample size (n): deterministic finder surfaces candidates, human picks ---
     # (the LLM proved unreliable at n; regex over the source is not — v3.1: locate
@@ -212,6 +329,7 @@ def main() -> None:
     # Only families whose n comes from a replicate statement (continuous) use the
     # finder; families that read totals in-table (binary) skip this panel.
     default_n = ""
+    n_source: dict[str, dict] = {}
     if family.has_sample_size:
         n_cands = find_sample_size_candidates(doc)
         if n_cands:
@@ -225,6 +343,20 @@ def main() -> None:
                 )
                 pick = n_cands[pi]
             default_n = pick.value
+            n_source = {
+                "n_c": {
+                    "source": "sample_size_finder",
+                    "block_id": pick.block_id,
+                    "page": pick.page,
+                    "evidence_text": pick.evidence_text,
+                },
+                "n_t": {
+                    "source": "sample_size_finder",
+                    "block_id": pick.block_id,
+                    "page": pick.page,
+                    "evidence_text": pick.evidence_text,
+                },
+            }
             st.caption(f"🧪 n = {pick.value} · source {pick.block_id} p{pick.page} — {pick.phrase}")
         else:
             st.caption("🧪 No sample-size statement found — enter n manually below.")
@@ -259,6 +391,14 @@ def main() -> None:
                 covariate_values[cov] = ccols[i % len(ccols)].text_input(
                     cov, key=f"cov_{scope}_{region.region_id}_{cov}"
                 ).strip()
+        identity_values: dict[str, str] = {}
+        st.markdown("**Record identity** — confirm the site, experiment, time, and depth for this row")
+        icols = st.columns(min(len(identity_fields), 3))
+        for i, identity_field in enumerate(identity_fields):
+            identity_values[identity_field] = icols[i % len(icols)].text_input(
+                identity_field,
+                key=f"identity_{scope}_{region.region_id}_{identity_field}",
+            ).strip()
 
         if region.citation.kind == "figure":
             st.info("Figure — read values with a digitizer (WebPlotDigitizer); AI never reads chart values (v3.1 §6).")
@@ -282,11 +422,24 @@ def main() -> None:
             digiref = st.text_input(
                 "Digitizer ref (file / screenshot / axis calibration)", key=f"fref_{scope}_{region.region_id}"
             )
+            funit, fdisp = st.columns(2)
+            fig_unit = funit.text_input("Unit", key=f"funit_{scope}_{region.region_id}")
+            fig_dispersion = (
+                fdisp.selectbox("Dispersion", ["sd", "se"], key=f"fdisp_{scope}_{region.region_id}")
+                if any(f.role.startswith("sd") for f in family.fields) else ""
+            )
             pair = {
                 "control_group": ctrl, "treatment_group": trt,
+                "unit": fig_unit, "dispersion": fig_dispersion,
                 **fig_entered, **covariate_values,
+                "record_identity": identity_values,
+                "identity_confirmed": False,
+                "moderator_binding_status": "pending",
+                "n_evidence": n_source,
                 "source": "figure_digitized", "status": status, "digitizer_ref": digiref,
             }
+            if n_source:
+                pair["evidence"] = n_source
             entered = {}
         else:
             st.text_area("Block text (source)", block.text, height=80, disabled=True)
@@ -313,6 +466,11 @@ def main() -> None:
                         ncol, ecol = st.columns(2)
                         n_c_val = ncol.text_input("Nc (control n)", value=default_n, key=f"nc_{scope}")
                         n_t_val = ecol.text_input("Ne (treatment n)", value=default_n, key=f"ne_{scope}")
+                        acol1, acol2 = st.columns(2)
+                        auto_unit = acol1.text_input("Unit for pairings", key=f"auto_unit_{scope}")
+                        auto_dispersion = acol2.selectbox(
+                            "Dispersion for pairings", ["sd", "se"], key=f"auto_disp_{scope}"
+                        )
                         rows = parse_block(block, col_labels)
                         if not rows:
                             st.caption(
@@ -339,7 +497,7 @@ def main() -> None:
                     if cands:
                         st.dataframe(
                             [{k: v for k, v in r.items() if k != "_bboxes"} for r in cands],
-                            use_container_width=True, height=140,
+                            width="stretch", height=140,
                         )
                         if st.button(
                             f"✓ Accept {len(cands)} pairings",
@@ -348,12 +506,28 @@ def main() -> None:
                         ):
                             for r in cands:
                                 rec = {k: v for k, v in r.items() if k != "_bboxes"}
+                                rec["evidence"] = {
+                                    role: {
+                                        "source": "geometry_auto",
+                                        "block_id": region.citation.block_id,
+                                        "page": region.citation.page,
+                                        "bbox": list(region.citation.bbox.as_tuple()),
+                                        "evidence_text": rec[role],
+                                    }
+                                    for role in ("mean_c", "sd_c", "mean_t", "sd_t")
+                                    if rec.get(role)
+                                }
                                 records.append({
                                     "paper_id": doc.doc_id, "variable_name": region.variable_name,
                                     "source_block_id": region.citation.block_id,
                                     "page": region.citation.page, "kind": region.citation.kind,
-                                    "unit": "", "dispersion": "",
+                                    "unit": auto_unit, "dispersion": auto_dispersion,
                                     "n_c": n_c_val, "n_t": n_t_val, **rec, **covariate_values,
+                                    "evidence": {**rec.get("evidence", {}), **n_source},
+                                    "n_evidence": n_source,
+                                    "record_identity": dict(identity_values),
+                                    "identity_confirmed": False,
+                                    "moderator_binding_status": "pending",
                                 })
                             st.session_state[cand_key] = []
                             reviewstore.append_log(
@@ -492,9 +666,14 @@ def main() -> None:
                 "dispersion": dispersion,
                 **entered,
                 **covariate_values,
+                "record_identity": identity_values,
+                "identity_confirmed": False,
+                "moderator_binding_status": "pending",
             }
             if field_evidence:
                 pair["evidence"] = field_evidence
+            if n_source:
+                pair["evidence"] = {**field_evidence, **n_source}
             if unmatched:
                 st.warning(f"Not found on page {region.citation.page} (typo?): {', '.join(unmatched)}")
 
@@ -502,45 +681,105 @@ def main() -> None:
                 values_to_highlight = [bb for r in cands for bb in r["_bboxes"]]
 
         if st.button("➕ Add record", type="primary", key=f"add_record_{scope}_{region.region_id}"):
-            records.append({
+            new_record = {
                 "paper_id": doc.doc_id,
                 "variable_name": region.variable_name,
                 "source_block_id": region.citation.block_id,
                 "page": region.citation.page,
                 "kind": region.citation.kind,
                 **pair,
-            })
+            }
+            record_flags = validate_record(new_record, family, source_doc=doc)
+            new_record["qa_flags"] = "; ".join(record_flags)
+            new_record["review_status"] = "needs_review" if record_flags else "ready"
+            records.append(new_record)
             reviewstore.append_log(
                 ROOT, study, "add_record",
                 variable_name=region.variable_name, records_after=len(records),
                 stamp=stamp,
             )
+            if record_flags:
+                st.warning(
+                    "Record saved as a draft; export remains disabled until fixed: "
+                    + ", ".join(record_flags)
+                )
             st.rerun()
 
     # --- left: PDF with evidence highlighted ---
     with left:
         if region.citation.kind == "figure":
             png = _render_crop(str(_pdf_path(study)), region.citation.page, region.citation.bbox.as_tuple())
-            st.image(png, use_container_width=True,
+            st.image(png, width="stretch",
                      caption=f"page {region.citation.page} — figure region (digitize values from here)")
         else:
             outline = (region.citation.bbox.as_tuple(),)
             vals = tuple(b.as_tuple() for b in values_to_highlight)
             png = _render(str(_pdf_path(study)), region.citation.page, outline, vals)
-            st.image(png, use_container_width=True,
+            st.image(png, width="stretch",
                      caption=f"page {region.citation.page} — blue: located block · red: entered values")
 
     # --- assembled records + export ---
     if records:
         st.divider()
         st.subheader(f"Assembled records ({len(records)})")
-        status = "bound" if bound else "unbound"
-        df = pd.DataFrame(
-            [{**bound, **r, "moderator_binding_status": status} for r in records]
+        df = pd.DataFrame(records)
+        st.caption(
+            "Paper-level moderator suggestions are reference values. Each row must have its "
+            "own confirmed identity and moderator binding before export."
         )
-        if not bound:
-            st.caption("⚠ No moderators bound yet — fill the Moderators panel to bind them.")
-        st.dataframe(df, use_container_width=True, height=200)
+        st.dataframe(df, width="stretch", height=200)
+
+        for i, record in enumerate(records):
+            with st.expander(
+                f"Row {i} identity and moderator binding · "
+                f"{record.get('variable_name', '')} · {record.get('moderator_binding_status', 'pending')}",
+                expanded=record.get("moderator_binding_status") != "bound",
+            ):
+                existing_identity = record.get("record_identity", {})
+                identity_inputs: dict[str, str] = {}
+                cols = st.columns(min(len(identity_fields), 3))
+                for j, field in enumerate(identity_fields):
+                    identity_inputs[field] = cols[j % len(cols)].text_input(
+                        field,
+                        value=str(existing_identity.get(field, "")),
+                        key=f"row_identity_{scope}_{i}_{field}",
+                    ).strip()
+                moderator_inputs: dict[str, str] = {}
+                existing_mods = record.get("moderators", {})
+                mcols = st.columns(3)
+                for j, field in enumerate(mod_fields):
+                    moderator_inputs[field] = mcols[j % len(mcols)].text_input(
+                        field,
+                        value=str(existing_mods.get(field, bound.get(field, ""))),
+                        key=f"row_mod_{scope}_{i}_{field}",
+                    ).strip()
+                if st.button(
+                    "Confirm this row's identity and moderators",
+                    key=f"confirm_row_binding_{scope}_{i}",
+                ):
+                    record["record_identity"] = identity_inputs
+                    record["identity_confirmed"] = True
+                    record["moderators"] = moderator_inputs
+                    record["moderator_binding_status"] = "bound"
+                    record["qa_flags"] = "; ".join(
+                        validate_record(
+                            record,
+                            family,
+                            source_doc=doc,
+                            identity_fields=tuple(identity_fields),
+                            moderator_fields=tuple(mod_fields),
+                        )
+                    )
+                    reviewstore.append_log(
+                        ROOT,
+                        study,
+                        "bind_record_moderators",
+                        variable_name=record.get("variable_name", ""),
+                        records_after=len(records),
+                        detail=f"row={i}",
+                        stamp=stamp,
+                    )
+                    st.rerun()
 
         # delete a record — needed to fix mistakes when resuming across sessions
         dcol, bcol = st.columns([4, 1])
@@ -559,18 +798,40 @@ def main() -> None:
             )
             st.rerun()
 
-        st.download_button(
-            "⬇ Export meta_ready.csv",
-            df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{study}_meta_ready.csv",
-            mime="text/csv",
+        export_rows, export_errors = validate_records_for_export(
+            records,
+            family,
+            source_doc=doc,
+            identity_fields=tuple(identity_fields),
+            require_identity=True,
+            moderator_fields=tuple(mod_fields),
         )
+        if export_errors:
+            st.error(
+                "Export disabled: every record must pass validation. "
+                + " | ".join(export_errors[:5])
+            )
+        else:
+            export_df = pd.DataFrame(export_rows)
+            st.download_button(
+                "⬇ Export meta_ready.csv",
+                export_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{study}_meta_ready.csv",
+                mime="text/csv",
+            )
 
     # Autosave the draft on every run so work survives refresh / restart. Mutating
     # actions rerun before reaching here; the *following* run persists the new state.
-    if records or bound:
-        saved_at = reviewstore.save_draft(ROOT, study, records, bound, stamp=stamp)
-        st.sidebar.caption(f"💾 Auto-saved · {len(records)} record(s) · {saved_at}")
+    saved_at = reviewstore.save_draft(
+        ROOT,
+        study,
+        records,
+        bound,
+        stamp=stamp,
+        screening_override=st.session_state.get(override_key, False),
+        coverage_status=coverage_status,
+    )
+    st.sidebar.caption(f"💾 Auto-saved · {len(records)} record(s) · {saved_at}")
     st.sidebar.caption(f"Draft: {reviewstore.draft_path(ROOT, study, stamp).name}")
 
 

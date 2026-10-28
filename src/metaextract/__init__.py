@@ -13,6 +13,7 @@ from .highlight import (
 )
 from .ingest import IngestError, ingest_pdf
 from .locate import SOIL_AGRI_SPEC, LocateOutput, TargetVar, TaskSpec, locate
+from .model_profiles import ModelProfile, ModelProfileConfig, load_model_profiles
 from .pipeline import run_folder
 from .records import Citation, LocatedRegion, ScreeningResult
 from .schema import ExtractionResult
@@ -49,6 +50,9 @@ __all__ = [
     "TaskSpec",
     "TargetVar",
     "SOIL_AGRI_SPEC",
+    "ModelProfile",
+    "ModelProfileConfig",
+    "load_model_profiles",
     # analysis families (per-record field set)
     "AnalysisFamily",
     "RecordField",

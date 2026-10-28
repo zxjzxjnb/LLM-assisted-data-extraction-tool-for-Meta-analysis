@@ -55,6 +55,13 @@ def test_span_not_in_block_is_flagged():
     assert not gr.verified and "span_not_in_block" in gr.flags
 
 
+def test_evidence_must_match_complete_numeric_tokens():
+    block = _block("SOC 123.0 -0.087")
+    assert not ground_verify("12", "12", block).verified
+    assert not ground_verify("23.0", "23.0", block).verified
+    assert not ground_verify("0.087", "0.087", block).verified
+
+
 def test_symbol_and_unicode_minus_tolerant():
     """The value -0.087 grounds against a span printed as −0.087**a."""
     block = _block("Treatment effect −0.087**a relative to control")
@@ -120,6 +127,10 @@ def test_thousands_separator_stored_value_matches_grounding():
     (slot,) = apply_grounding(raw, block, _region())
     assert slot.grounding_verified
     assert slot.value == 1234  # not 1
+
+
+def test_ambiguous_comma_decimal_is_not_silently_reinterpreted():
+    assert ground_verify("2,3", "2,3", _block("effect 2,3")).verified is False
 
 
 def test_chemical_formula_is_not_a_grounded_number():

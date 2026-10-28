@@ -105,7 +105,10 @@ def main(argv: list[str] | None = None) -> int:
             import json
             from pathlib import Path
 
-            Path(args.report).write_text(json.dumps(report, indent=2))
+            from .fileio import atomic_write_text
+
+            Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(args.report, json.dumps(report, indent=2))
         return 0
 
     if args.command == "agent":
@@ -183,7 +186,10 @@ def main(argv: list[str] | None = None) -> int:
 
             report_path = Path(args.report)
             report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text(
+            from .fileio import atomic_write_text
+
+            atomic_write_text(
+                report_path,
                 json.dumps(result.model_dump(mode="json"), indent=2, ensure_ascii=False)
             )
             print(f"full run -> {args.report}")

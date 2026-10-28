@@ -10,8 +10,6 @@ ReplayPlanner drives the full loop end to end.
 import json
 from types import SimpleNamespace
 
-import pytest
-
 from metaextract.agent import OpenAICompatiblePlanner, ReplayPlanner, build_toolset, run_agent
 from metaextract.agent.report import load_review_queue
 from metaextract.agent.gate import record_status
@@ -41,7 +39,7 @@ def _doc(with_figure: bool = False) -> SourceDoc:
             kind="paragraph",
             page=1,
             bbox=BBox(x0=0, y0=90, x1=260, y1=120),
-            text="SOC 12.0 1.0 20.0 2.0",
+            text="SOC 12.0 1.0 20.0 2.0 n 3",
             words=words,
         )
     ]
@@ -77,8 +75,12 @@ def _out(with_figure: bool = False) -> LocateOutput:
 # --- the gate ------------------------------------------------------------------
 def test_ground_check_accepts_real_and_rejects_fabricated():
     ts = build_toolset(_doc(), _out())
-    real = ts.ground_check({"block_id": "p1.b1", "value": "12.0"})
-    fake = ts.ground_check({"block_id": "p1.b1", "value": "99999.0"})
+    real = ts.ground_check(
+        {"block_id": "p1.b1", "value": "12.0", "evidence_text": "12.0"}
+    )
+    fake = ts.ground_check(
+        {"block_id": "p1.b1", "value": "99999.0", "evidence_text": "99999.0"}
+    )
     assert real["grounded"] is True
     assert fake["grounded"] is False and "span_not_in_block" in fake["flags"]
 
@@ -100,9 +102,8 @@ def test_saved_agent_report_becomes_a_review_queue(tmp_path):
     queue = load_review_queue(report, study="PX")
 
     assert queue.warning == ""
-    assert len(queue.flags) == 1
     assert queue.flags[0].region_id == REGION_ID
-    assert queue.flags[0].reason == "multi_row_block_needs_row_assignment"
+    assert any(f.reason == "multi_row_block_needs_row_assignment" for f in queue.flags)
 
 
 def test_review_queue_rejects_report_for_another_paper(tmp_path):
@@ -121,10 +122,12 @@ def test_propose_then_commit_is_verified():
         {
             "region_id": REGION_ID,
             "values": [
-                {"role": "mean_c", "value": "12.0"},
-                {"role": "sd_c", "value": "1.0"},
-                {"role": "mean_t", "value": "20.0"},
-                {"role": "sd_t", "value": "2.0"},
+                {"role": "mean_c", "value": "12.0", "evidence_text": "12.0"},
+                {"role": "sd_c", "value": "1.0", "evidence_text": "1.0"},
+                {"role": "mean_t", "value": "20.0", "evidence_text": "20.0"},
+                {"role": "sd_t", "value": "2.0", "evidence_text": "2.0"},
+                {"role": "n_c", "value": "3", "evidence_text": "n 3"},
+                {"role": "n_t", "value": "3", "evidence_text": "n 3"},
             ],
         }
     )
@@ -156,7 +159,7 @@ def test_record_status_needs_all_highlightable_grounded():
     family = get_family(None)
     grounded = ExtractionSlot(slot_id="s1", region_id="r", role="mean_c", grounding_verified=True)
     ungrounded = ExtractionSlot(slot_id="s2", region_id="r", role="mean_t", grounding_verified=False)
-    assert record_status([grounded], family) == "verified"
+    assert record_status([grounded], family) == "needs_review"
     assert record_status([grounded, ungrounded], family) == "needs_review"
     assert record_status([], family) == "needs_review"
 
@@ -172,10 +175,8 @@ def test_commit_without_proposing_is_flagged_not_committed():
 def test_replay_loop_produces_verified_record_and_shows_the_gate():
     result = run_agent(build_toolset(_doc(), _out()), ReplayPlanner())
 
-    assert result.verified_records, "the SOC table region should verify"
-    rec = result.verified_records[0]
-    assert rec.variable_name == "soil organic carbon"
-    assert rec.slots["mean_t"].value == 20.0
+    assert not result.verified_records, "incomplete records must not verify"
+    assert result.needs_review_records
 
     # The run visibly exercises the gate: one probe grounds, one is rejected.
     probes = [s.summary for s in result.trace if s.tool == "ground_check"]
@@ -189,8 +190,9 @@ def test_replay_flags_figure_regions_for_digitizing():
     result = run_agent(build_toolset(_doc(with_figure=True), _out(with_figure=True)), ReplayPlanner())
     reasons = {f.reason for f in result.flagged}
     assert "figure_region_needs_digitizing" in reasons
-    # the table region still verifies despite the figure region being flagged
-    assert any(r.variable_name == "soil organic carbon" for r in result.verified_records)
+    # the table region is also incomplete because ReplayPlanner has no n source;
+    # it must remain in the human review queue rather than being called verified.
+    assert any(r.variable_name == "soil organic carbon" for r in result.needs_review_records)
 
 
 # --- tool schemas --------------------------------------------------------------
@@ -202,6 +204,49 @@ def test_tool_specs_are_function_call_ready():
     assert "$ref" not in blob and "$defs" not in blob  # Gemini rejects these
     for s in specs:
         assert s.name and s.description and s.parameters.get("type") == "object"
+
+
+def test_sample_size_tool_preserves_exact_citation_text():
+    doc = _doc().model_copy(update={
+        "blocks": [
+            *_doc().blocks,
+            SourceBlock(
+                block_id="p1.methods",
+                kind="paragraph",
+                page=1,
+                bbox=BBox(x0=0, y0=0, x1=260, y1=120),
+                text="All measurements were run in triplicate.",
+            ),
+        ]
+    })
+    result = build_toolset(doc, _out()).find_sample_sizes({})
+    assert result["candidates"][0]["value"] == "3"
+    assert result["candidates"][0]["block_id"] == "p1.methods"
+    assert result["candidates"][0]["evidence_text"] == "All measurements were run in triplicate."
+
+
+def test_n_values_can_be_grounded_against_a_methods_block():
+    methods = SourceBlock(
+        block_id="p1.methods",
+        kind="paragraph",
+        page=1,
+        bbox=BBox(x0=0, y0=0, x1=260, y1=120),
+        text="All measurements were run in triplicate.",
+    )
+    doc = _doc().model_copy(update={"blocks": [*_doc().blocks, methods]})
+    ts = build_toolset(doc, _out())
+    values = [
+        {"role": "mean_c", "value": "12.0", "evidence_text": "12.0"},
+        {"role": "sd_c", "value": "1.0", "evidence_text": "1.0"},
+        {"role": "mean_t", "value": "20.0", "evidence_text": "20.0"},
+        {"role": "sd_t", "value": "2.0", "evidence_text": "2.0"},
+        {"role": "n_c", "value": "3", "evidence_text": "in triplicate.", "source_block_id": "p1.methods"},
+        {"role": "n_t", "value": "3", "evidence_text": "in triplicate.", "source_block_id": "p1.methods"},
+    ]
+    assert all(v["grounded"] for v in ts.propose_values({"region_id": REGION_ID, "values": values})["verdicts"])
+    committed = ts.commit_record({"region_id": REGION_ID, "treatment_group": "AF", "control_group": "NF"})
+    assert committed["status"] == "verified"
+    assert ts.records[0].slots["n_c"].citation.block_id == "p1.methods"
 
 
 def test_extract_values_is_only_advertised_with_a_live_tier3_client():

@@ -28,19 +28,21 @@ def verify(block: SourceBlock, value: str, evidence_text: str) -> GroundingResul
 
 
 def record_status(slots: list[ExtractionSlot], family: AnalysisFamily) -> str:
-    """``"verified"`` only if every highlightable value is grounding-verified.
-
-    A family's highlightable fields are the ones that live in the source table (a
-    mean/SD, not an ``n`` read from the methods text). The agent may only call a
-    record ``verified`` when all of those present passed the gate; if any failed
-    grounding, or none were filled, the record is ``needs_review`` so a human looks
-    at it. This mirrors what the cockpit paints red.
-    """
-    highlight_roles = {f.role for f in family.fields if f.highlight}
-    relevant = [s for s in slots if s.role in highlight_roles]
-    if not relevant:
+    """Return ``verified`` only for a complete and grounded record."""
+    by_role = {s.role: s for s in slots}
+    if any(
+        role not in by_role or by_role[role].value is None
+        for role in family.required_roles
+    ):
         return "needs_review"
-    return "verified" if all(s.grounding_verified for s in relevant) else "needs_review"
+    return (
+        "verified"
+        if all(
+            not field.highlight or by_role[field.role].grounding_verified
+            for field in family.fields
+        )
+        else "needs_review"
+    )
 
 
 def assemble_record(
@@ -57,7 +59,12 @@ def assemble_record(
     the gate. Every slot keeps its citation, so each number stays jumpable.
     """
     by_role = {s.role: s for s in slots}
-    flags = sorted({f for s in slots for f in s.flags})
+    flags = {f for s in slots for f in s.flags}
+    flags.update(
+        f"missing_required_role:{role}"
+        for role in family.required_roles
+        if role not in by_role or by_role[role].value is None
+    )
     status = record_status(slots, family)
     return VerifiedRecord(
         record_id=f"{region.region_id}:{treatment_group}",
@@ -68,7 +75,7 @@ def assemble_record(
         control_group=control_group,
         slots=by_role,
         status=status,
-        flags=flags,
+        flags=sorted(flags),
         reviewed_by="agent",
         reviewed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )

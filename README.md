@@ -146,13 +146,20 @@ Evaluation is ongoing and should be read conservatively.
 
 - Deterministic unit tests cover validation, location resolution, highlighting,
   sampling candidates, and table-geometry helpers.
-- Cached P1-P12 paper experiments are included for development and analysis.
+- The local demo workspace has cached P1-P12 paper experiments; PDFs and caches
+  are excluded from a source checkout and require the separate demo package or
+  locally prepared inputs.
 - One clean table paper has been used as a smoke test for geometry-assisted
   pairing against hand extraction.
 - Corpus-level location and value checks exist in `scripts/benchmark.py`,
   `scripts/bench_values.py`, and `scripts/eval_against_gt.py`.
 - The current evidence supports the human-in-the-loop direction, not a claim
   that the system can fully automate extraction across all paper formats.
+
+`verified` has a narrow machine meaning: all required fields are present and the
+highlightable values pass exact-token grounding against the cited block. It does
+not prove row/column identity, unit comparability, or human approval; the cockpit
+only offers an analysis export after its record validator passes.
 
 The main open problem is generalization across diverse table and figure formats.
 Simple normal tables can benefit from geometry-assisted pairing; transposed,
@@ -180,11 +187,15 @@ For development, install optional dependencies:
 pip install -e ".[dev]"
 ```
 
-Create a `.env` file or export the required environment variable for Gemini:
+Create a `.env` file or export the required environment variable for the default
+Gemini locator:
 
 ```bash
 export GOOGLE_API_KEY="your-api-key"
 ```
+
+To use a compatible model, configure a profile as described below and export the
+key named by that profile's `api_key_env`.
 
 For the DeepSeek agent planner, export its key separately:
 
@@ -221,6 +232,9 @@ metaextract eval \
   --report data/outputs/evaluation_report.json
 ```
 
+The example truth file is not included in a source checkout; provide your own
+reviewed CSV or evaluation fixture before running this command.
+
 Launch the local cockpit prototype after installing development dependencies:
 
 ```bash
@@ -233,6 +247,22 @@ study from `data/sample_papers/{study}.pdf`, use:
 ```bash
 python scripts/prepare_paper.py P1
 ```
+
+The locator can also use any OpenAI-compatible endpoint through a named profile.
+Copy `data/model_profiles.example.yaml` to `data/model_profiles.yaml`, set the
+API-key environment variable, and select the profile:
+
+```bash
+export METAEXTRACT_MODEL_PROFILES=data/model_profiles.yaml
+export DASHSCOPE_API_KEY=your-key
+python scripts/prepare_paper.py P1 --profile qwen
+```
+
+Each profile controls `endpoint`, `model`, `api_key_env`, and `response_mode`
+(`auto`, `json_schema`, or `json_object`). The built-in Gemini profile and every
+profile with `fallbacks: []` run without switching models. Add profile names to
+`fallbacks` only when a model switch is explicitly wanted; the cache records the
+profile, endpoint, response mode, and fallback reasons used for that paper.
 
 ## Benchmark and Development Commands
 
@@ -344,7 +374,7 @@ target_variables:
 
 | Family | Per-record fields | Effect sizes | Status |
 | --- | --- | --- | --- |
-| `continuous_two_arm` (default) | `mean/sd/n` per arm (`Xc Sc Nc Xe Se Ne`) | lnRR, SMD / Hedges' g | **Validated** on the soil/land-use corpus (P1–P12) |
+| `continuous_two_arm` (default) | `mean/sd/n` per arm (`Xc Sc Nc Xe Se Ne`) | lnRR, SMD / Hedges' g | **Smoke-tested** on the soil/land-use corpus (P1–P12); not a corpus-wide accuracy claim |
 | `binary_two_arm` | `events/total` per arm | OR, RR | ⚠️ **Experimental — structurally supported, never tested on real binary-outcome papers** |
 
 > ⚠️ **`binary_two_arm` and any future non-default family are untested.** The

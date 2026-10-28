@@ -95,6 +95,7 @@ class SourceDoc(BaseModel):
     n_pages: int
     page_sizes: dict[int, tuple[float, float]] = Field(default_factory=dict)  # page -> (w, h)
     blocks: list[SourceBlock] = Field(default_factory=list)
+    source_sha256: Optional[str] = None
 
     def block(self, block_id: str) -> Optional[SourceBlock]:
         return next((b for b in self.blocks if b.block_id == block_id), None)

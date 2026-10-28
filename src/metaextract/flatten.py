@@ -11,6 +11,16 @@ from .schema import ExtractionResult
 from .validator import validate_result
 
 
+FLAT_COLUMNS = [
+    "source_file", "first_author", "year", "site_name", "coordinates", "country",
+    "mean_annual_temp_c", "mean_annual_precip_mm", "soil_type_wrb", "soil_texture",
+    "initial_ph", "initial_soc_g_kg", "exp_duration_years", "treatments_overview",
+    "variable_name", "unit", "treatment_group", "control_group", "mean_t", "sd_t",
+    "n_t", "mean_c", "sd_c", "n_c", "source", "sampling_depth_cm",
+    "measurement_year", "qa_flags",
+]
+
+
 def result_to_rows(result: ExtractionResult, source_file: str) -> list[dict]:
     """Convert one paper's result into a list of flat row dicts."""
     si = result.study_info

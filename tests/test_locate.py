@@ -80,6 +80,19 @@ def test_duplicate_regions_are_deduped():
     assert len(regions) == 1
 
 
+def test_unknown_target_variable_is_dropped_when_task_vocabulary_is_supplied():
+    doc = _doc()
+    raw = LocatorResponse(
+        include=True,
+        regions=[RawRegion(block_id="p1.b1", variable_name="invented metric")],
+    )
+    regions, problems = resolve_regions(
+        doc, raw, doc.doc_id, allowed_variables={"n2o emission": "N2O emission"}
+    )
+    assert not regions
+    assert problems and "invented metric" in problems[0]
+
+
 def test_moderators_keep_value_and_attach_citation_when_block_real():
     doc = _doc()
     raw = LocatorResponse(
@@ -107,6 +120,19 @@ def test_moderators_dedupe_by_field():
         ],
     )
     assert len(resolve_moderators(doc, raw)) == 1
+
+
+def test_moderators_are_limited_to_task_pack_fields():
+    doc = _doc()
+    raw = LocatorResponse(
+        include=True,
+        moderators=[
+            RawModerator(field="Climate", value="subalpine", block_id="p1.b1"),
+            RawModerator(field="invented moderator", value="x", block_id="p1.b1"),
+        ],
+    )
+    mods = resolve_moderators(doc, raw, allowed_fields={"climate": "Climate"})
+    assert [m.field for m in mods] == ["Climate"]
 
 
 def test_response_schema_has_no_refs():

@@ -214,6 +214,7 @@ __marimo__/
 .claude/
 data/cache/
 data/reviews/
+data/model_profiles.yaml
 
 # Generated outputs and local review reports
 data/outputs/

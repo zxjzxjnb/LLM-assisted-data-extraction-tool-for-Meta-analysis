@@ -1,12 +1,13 @@
 """On-disk cache so the cockpit runs offline (no API call per launch).
 
-``prepare`` runs the expensive stages once (ingest + Gemini locate) and writes
+``prepare`` runs the expensive stages once (ingest + configured locator) and writes
 two JSON files per paper; the Streamlit app only ever reads them.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,7 +99,7 @@ def _resolve_locate_path(d: Path, study: str, stamp: str | None) -> Path:
         return stamped[0]
     if len(stamped) > 1:
         names = ", ".join(p.name for p in stamped)
-        raise ValueError(
+        raise CacheError(
             f"{study!r} has several task-pack locate caches ({names}); "
             "pass stamp= to choose one."
         )
@@ -119,6 +120,18 @@ def load(root: Path, study: str, stamp: str | None = None) -> tuple[SourceDoc, L
     d = cache_dir(root)
     doc = _load_sourcedoc(d, study)
     out = _load_locate(d, study, stamp)
+    if doc.source_sha256 and out.source_sha256 and doc.source_sha256 != out.source_sha256:
+        raise CacheError(
+            f"Cache files for {study!r} refer to different source versions — "
+            f"{_rerun_hint(study)}."
+        )
+    pdf = root / "data" / "sample_papers" / f"{study}.pdf"
+    if doc.source_sha256 and pdf.exists():
+        actual = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        if actual != doc.source_sha256:
+            raise CacheError(
+                f"Source PDF {pdf.name} changed after ingest — {_rerun_hint(study)}."
+            )
     return doc, out
 
 
@@ -136,7 +149,7 @@ def _load_sourcedoc(d: Path, study: str) -> SourceDoc:
 
 
 def _load_locate(d: Path, study: str, stamp: str | None) -> LocateOutput:
-    path = _resolve_locate_path(d, study, stamp)  # ValueError here = ambiguous stamp, kept as-is
+    path = _resolve_locate_path(d, study, stamp)
     try:
         text = path.read_text()
     except FileNotFoundError:

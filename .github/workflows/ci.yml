@@ -33,3 +33,6 @@ jobs:
 
       - name: Run tests
         run: python -m pytest
+
+      - name: Run lint
+        run: ruff check src app tests scripts

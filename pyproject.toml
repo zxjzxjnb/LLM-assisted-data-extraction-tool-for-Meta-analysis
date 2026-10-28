@@ -21,12 +21,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-app = ["streamlit>=1.30"]
+app = ["streamlit>=1.50"]
 eval = ["openpyxl>=3.1"]
 dev = [
     "pytest>=7.0",
-    "streamlit>=1.30",
+    "streamlit>=1.50",
     "openpyxl>=3.1",
+    "ruff>=0.15",
 ]
 
 [project.scripts]

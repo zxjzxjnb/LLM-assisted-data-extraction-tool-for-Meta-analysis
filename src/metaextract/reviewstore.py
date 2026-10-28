@@ -77,6 +77,8 @@ def load_draft(root: Path, study: str, stamp: str | None = None) -> dict:
     """
     p = draft_path(root, study, stamp)
     if not p.exists():
+        # Keep the historical empty shape for callers that use this as a cheap
+        # existence probe; the cockpit reads the new fields with ``get``.
         return {"records": [], "moderators": {}}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -87,6 +89,8 @@ def load_draft(root: Path, study: str, stamp: str | None = None) -> dict:
         return {
             "records": [],
             "moderators": {},
+            "screening_override": False,
+            "coverage_status": {},
             "error": (
                 f"Saved draft {p.name} could not be read ({type(e).__name__}); it was "
                 f"preserved as {backup.name} and an empty draft was started. If it held "
@@ -95,11 +99,20 @@ def load_draft(root: Path, study: str, stamp: str | None = None) -> dict:
         }
     data.setdefault("records", [])
     data.setdefault("moderators", {})
+    data.setdefault("screening_override", False)
+    data.setdefault("coverage_status", {})
     return data
 
 
 def save_draft(
-    root: Path, study: str, records: list[dict], moderators: dict, stamp: str | None = None
+    root: Path,
+    study: str,
+    records: list[dict],
+    moderators: dict,
+    stamp: str | None = None,
+    *,
+    screening_override: bool = False,
+    coverage_status: dict[str, str] | None = None,
 ) -> str:
     """Rewrite the whole draft. Cheap (tens of records); used as an autosave.
 
@@ -112,6 +125,8 @@ def save_draft(
         "saved_at": saved_at,
         "records": records,
         "moderators": moderators,
+        "screening_override": screening_override,
+        "coverage_status": coverage_status or {},
     }
     # Atomic: a refresh / restart mid-write must not truncate the draft, since
     # that is the human's only copy of the assembled records.

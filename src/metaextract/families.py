@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 Arm = Literal["control", "treatment", "shared"]
 
@@ -52,6 +52,11 @@ class AnalysisFamily(BaseModel):
     # columns, so it only applies to continuous designs. Other families fall back
     # to manual entry.
     pairing: bool = False
+
+    @property
+    def required_roles(self) -> list[str]:
+        """Roles that must be present before a record is analysis-eligible."""
+        return [f.role for f in self.fields]
 
     @property
     def roles(self) -> list[str]:
@@ -137,5 +142,11 @@ RESERVED_RECORD_KEYS: frozenset[str] = frozenset(
         "status",
         "digitizer_ref",
         "moderator_binding_status",
+        "record_identity",
+        "identity_confirmed",
+        "moderators",
+        "n_evidence",
+        "qa_flags",
+        "review_status",
     }
 )

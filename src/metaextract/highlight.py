@@ -58,8 +58,16 @@ def parse_number(token: str) -> Optional[float]:
     m = _NUM_AT_START.match(token)
     if m is None:
         return None
+    numeric = m.group()
+    if "," in numeric and "." not in numeric:
+        groups = numeric.lstrip("+-").split(",")
+        # Treat comma as a thousands separator only when every trailing group
+        # has exactly three digits. Ambiguous locale decimals such as ``2,3``
+        # are rejected instead of silently becoming 23.
+        if len(groups) < 2 or any(len(group) != 3 for group in groups[1:]):
+            return None
     try:
-        return float(m.group().replace(",", ""))  # drop thousands separators
+        return float(numeric.replace(",", ""))  # drop thousands separators
     except ValueError:
         return None
 
@@ -128,7 +136,7 @@ def locate_span(block: SourceBlock, text: str) -> Optional[Match]:
     qn = [_norm(t) for t in query]
     for i in range(len(words) - len(query) + 1):
         window = words[i : i + len(query)]
-        if all(_norm(w.text).startswith(q) or q.startswith(_norm(w.text)) for w, q in zip(window, qn)):
+        if all(_norm(w.text) == q for w, q in zip(window, qn)):
             box = BBox.union([w.bbox for w in window])
             if box is not None:
                 return Match(bbox=box, words=window, exact=True)
@@ -151,6 +159,15 @@ def numeric_in_text(value, text: str, rel_tol: float = 1e-9) -> bool:
     target = _num(str(value))
     if target is None:
         return _norm(str(value)) in _norm(text)
+    # Methods often state replicate counts as words ("in triplicate") rather
+    # than printing the digit.  The deterministic sample-size finder uses the
+    # same convention, so the evidence gate must recognise those two controlled
+    # spellings as numeric evidence too.
+    lowered = _norm(text)
+    if target == 3 and re.search(r"\btriplicate\b", lowered):
+        return True
+    if target == 2 and re.search(r"\bduplicate\b", lowered):
+        return True
     for tok in re.split(r"\s+", text):
         tv = _num(tok)
         if tv is None:
@@ -166,4 +183,11 @@ def text_contains(haystack: str, needle: str) -> bool:
     The *evidence-span ⊆ cited-block* half of the grounding gate: the model's
     claimed span must really appear in the block it cited.
     """
-    return bool(needle) and _norm(needle) in _norm(haystack)
+    source = [t for t in re.split(r"\s+", _norm(haystack)) if t]
+    query = [t for t in re.split(r"\s+", _norm(needle)) if t]
+    if not query or len(query) > len(source):
+        return False
+    return any(
+        source[i : i + len(query)] == query
+        for i in range(len(source) - len(query) + 1)
+    )
